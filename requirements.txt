@@ -5,7 +5,3 @@ urllib3
 pandas
 openpyxl
 PyJWT>=2.8.0
-
-# Optional — only needed to migrate attachment binaries (browser-session CDN).
-# Install with:  pip install playwright && playwright install chromium
-# playwright
