@@ -1,0 +1,62 @@
+{
+    "qase": {
+        "api_token": "<QASE_API_TOKEN>",
+        "host": "qase.io",
+        "throttle_requests": 120,
+        "throttle_interval_sec": 12,
+        "rate_limit_max_retries": 8
+    },
+    "users": {
+        "default": 1,
+        "map": {},
+        "resolve_from_jira": true
+    },
+    "features": {
+        "component_custom_field": false,
+        "component_field_title": "Feature Area",
+        "component_field_fallback_option": "No Feature Area",
+        "single_suite": false,
+        "single_suite_title": "Migrated from Zephyr",
+        "required_field_defaults": {}
+    },
+    "zephyr": {
+        "account_id": "<ATLASSIAN_ACCOUNT_ID>",
+        "access_key": "<ZAPI_ACCESS_KEY>",
+        "secret_key": "<ZAPI_SECRET_KEY>",
+        "base_url": "https://prod-api.zephyr4jiracloud.com/connect",
+        "max_requests_per_min": 25,
+        "attachments": {
+            "enabled": true
+        }
+    },
+    "jira": {
+        "base_url": "https://your-site.atlassian.net",
+        "email": "",
+        "api_token": ""
+    },
+    "projects": {
+        "import_all": false,
+        "import": [
+            "KEY1"
+        ],
+        "exclude": [],
+        "mapping": {}
+    },
+    "cases": {
+        "priority_map": {},
+        "jira_statuses": [],
+        "preserve_ids": true,
+        "limit": 0,
+        "batch_size": 50
+    },
+    "runs": {
+        "created_after": 0,
+        "status_map": {},
+        "concurrency": 6
+    },
+    "migration": {
+        "allow_existing_target": false,
+        "delta": false,
+        "qase_bulk_hydrate_case_ids": false
+    }
+}

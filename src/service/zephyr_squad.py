@@ -1,0 +1,240 @@
+from ..api.jira_lookup import JiraLookupClient
+from ..api.zephyr_squad import ZephyrSquadApiClient
+from ..support.config_manager import ConfigManager
+from ..support.logger import Logger
+
+_DEFAULT_BASE_URL = "https://prod-api.zephyr4jiracloud.com/connect"
+
+
+class ZephyrSquadService:
+    """Service wrapper around the ZAPI v1.0 client + a first-class Jira read client.
+
+    Classic Zephyr Squad splits a "test" across two systems:
+      * **Jira** owns the test issue (summary, description, priority, components,
+        labels) — enumerated via ``get_test_issues``.
+      * **ZAPI** owns test **steps**, **cycles**, **executions**, **step results**,
+        statuses and **attachments** — via the ZephyrSquadApiClient.
+
+    Both clients are READ-ONLY (GET only). Jira credentials are REQUIRED for a
+    full migration (without them, test issues cannot be enumerated); the service
+    still constructs so read-only preflight can report the gap clearly.
+    """
+
+    def __init__(self, config: ConfigManager, logger: Logger):
+        self.config = config
+        self.logger = logger
+
+        account_id = str(config.get("zephyr.account_id") or "").strip()
+        access_key = str(config.get("zephyr.access_key") or "").strip()
+        secret_key = str(config.get("zephyr.secret_key") or "").strip()
+        base_url = str(config.get("zephyr.base_url") or _DEFAULT_BASE_URL).strip()
+        page_size = int(config.get("zephyr.page_size") or 100)
+
+        self.client = ZephyrSquadApiClient(
+            account_id=account_id,
+            access_key=access_key,
+            secret_key=secret_key,
+            logger=logger,
+            base_url=base_url,
+            page_size=page_size,
+            max_requests_per_min=float(config.get("zephyr.max_requests_per_min") or 30),
+        )
+
+        jira_base = str(config.get("jira.base_url") or "").strip()
+        jira_email = str(config.get("jira.email") or "").strip()
+        jira_token = str(config.get("jira.api_token") or "").strip()
+        self.jira = None
+        if jira_base and jira_email and jira_token:
+            self.jira = JiraLookupClient(jira_base, jira_email, jira_token, logger)
+            self.logger.log("[ZephyrSquad] Jira read client ENABLED")
+        else:
+            self.logger.log(
+                "[ZephyrSquad] Jira read client DISABLED (no jira.* config) — test "
+                "cases CANNOT be enumerated (classic Squad tests are Jira issues). "
+                "Set jira.base_url / jira.email / jira.api_token in config.json.",
+                "warning",
+            )
+
+        self.issue_type = str(config.get("cases.jira_issue_type") or "Test").strip() or "Test"
+        # Optional Jira status filter, e.g. ["Testing"] — migrate only the live
+        # tests. Empty/absent = every status (previous behaviour).
+        _statuses = config.get("cases.jira_statuses")
+        if isinstance(_statuses, str):
+            _statuses = [_statuses]
+        self.issue_statuses = [
+            str(s).strip() for s in (_statuses or []) if str(s).strip()
+        ]
+        if self.issue_statuses:
+            self.logger.log(
+                f"[ZephyrSquad] Test-issue status filter: {self.issue_statuses} "
+                f"(only these Jira statuses will be migrated)"
+            )
+
+        # Per-project caches for Jira lookups
+        self._component_names: dict = {}
+        self._version_names: dict = {}
+        self._issue_keys: dict = {}
+
+    # ------------------------------------------------------------------
+    # Projects & versions  (ZAPI)
+    # ------------------------------------------------------------------
+
+    def get_projects(self) -> list:
+        self.logger.log("[ZephyrSquad] Fetching projects (ZAPI /util/project-list)")
+        return self.client.get_projects()
+
+    # Versions come from Jira (ZAPI Cloud has no version-list endpoint) —
+    # see get_version_names below.
+
+    # ------------------------------------------------------------------
+    # Cycles & executions  (ZAPI, GET-only) — used by the deferred runs step
+    # ------------------------------------------------------------------
+
+    def get_cycles(self, project_id, version_id) -> list:
+        return self.client.get_cycles(project_id, version_id)
+
+    def get_cycle(self, cycle_id, project_id, version_id) -> dict:
+        return self.client.get_cycle(cycle_id, project_id, version_id)
+
+    def get_executions_by_cycle(self, cycle_id, project_id, version_id):
+        yield from self.client.get_executions_by_cycle(cycle_id, project_id, version_id)
+
+    def get_executions_by_issue(self, issue_id, project_id) -> list:
+        return self.client.get_executions_by_issue(issue_id, project_id)
+
+    # ------------------------------------------------------------------
+    # Test steps & step results  (ZAPI)  — keyed by Jira issue id
+    # ------------------------------------------------------------------
+
+    def get_test_steps(self, issue_id, project_id=None) -> list:
+        return self.client.get_test_steps(issue_id, project_id)
+
+    def get_step_results(self, execution_id) -> list:
+        return self.client.get_step_results(execution_id)
+
+    # ------------------------------------------------------------------
+    # Statuses  (ZAPI)
+    # ------------------------------------------------------------------
+
+    def get_execution_statuses(self) -> list:
+        return self.client.get_execution_statuses()
+
+    def get_step_execution_statuses(self) -> list:
+        return self.client.get_step_execution_statuses()
+
+    # ------------------------------------------------------------------
+    # Attachments  (ZAPI, sanctioned GET read endpoints) — deferred phase
+    # ------------------------------------------------------------------
+
+    def get_execution_attachments(self, project_id, issue_id, entity_id) -> list:
+        return self.client.get_execution_attachments(project_id, issue_id, entity_id)
+
+    def get_teststep_attachments(self, project_id, issue_id, entity_id) -> list:
+        return self.client.get_teststep_attachments(project_id, issue_id, entity_id)
+
+    def download_attachment_bytes(self, attachment_id, project_id=None, issue_id=None) -> bytes:
+        return self.client.download_attachment_bytes(attachment_id, project_id, issue_id)
+
+    # ------------------------------------------------------------------
+    # Jira (first-class source: test issues + name resolution)
+    # ------------------------------------------------------------------
+
+    def get_test_issues(self, project_key: str):
+        """Yield pages of Jira test issues.
+
+        Scope comes from config: ``cases.jira_issue_type`` (default ``Test``) and
+        the optional ``cases.jira_statuses`` — e.g. ``["Testing"]`` to migrate only
+        live tests and skip closed/obsolete ones.
+        """
+        if not self.jira:
+            self.logger.log(
+                "[ZephyrSquad] Cannot fetch test issues — Jira client disabled", "error"
+            )
+            return
+        yield from self.jira.search_test_issues(
+            project_key, issue_type=self.issue_type, statuses=self.issue_statuses
+        )
+
+    def get_issue_attachments(self, issue_id_or_key) -> list:
+        if not self.jira:
+            return []
+        return self.jira.get_issue_attachments(issue_id_or_key)
+
+    def download_jira_attachment_bytes(self, url: str) -> bytes:
+        if not self.jira:
+            return None
+        return self.jira.download_attachment_bytes(url)
+
+    def get_jira_project(self, project_key: str) -> dict:
+        """Full Jira project dict ({id, key, name, ...}) — the source of the
+        numeric projectId and display name (ZAPI Cloud has no project-list)."""
+        if not self.jira:
+            return {}
+        try:
+            return self.jira.get_project(project_key) or {}
+        except Exception as e:
+            self.logger.log(
+                f"[ZephyrSquad] Jira project lookup failed for {project_key}: {e}", "warning"
+            )
+            return {}
+
+    def get_jira_project_name(self, project_key: str) -> str:
+        return (self.get_jira_project(project_key).get("name") or "").strip()
+
+    def get_jira_user(self, account_id) -> dict:
+        """{accountId, emailAddress, displayName} for an Atlassian account id.
+
+        READ-ONLY; used to retain authorship by matching source users onto users
+        that already exist in Qase. ``{}`` when Jira is disabled or lookup fails.
+        """
+        if not self.jira or not account_id:
+            return {}
+        try:
+            return self.jira.get_user(account_id) or {}
+        except Exception as e:
+            self.logger.log(
+                f"[ZephyrSquad] Jira user lookup failed for {account_id}: {e}", "warning"
+            )
+            return {}
+
+    def get_component_names(self, project_key: str) -> dict:
+        """{component_id → name} for the project; empty when Jira is disabled."""
+        if not self.jira:
+            return {}
+        if project_key not in self._component_names:
+            try:
+                self._component_names[project_key] = self.jira.get_component_names(project_key)
+            except Exception as e:
+                self.logger.log(
+                    f"[ZephyrSquad] Jira component lookup failed for {project_key}: {e}",
+                    "warning",
+                )
+                self._component_names[project_key] = {}
+        return self._component_names[project_key]
+
+    def get_version_names(self, project_key: str) -> dict:
+        if not self.jira:
+            return {}
+        if project_key not in self._version_names:
+            try:
+                self._version_names[project_key] = self.jira.get_version_names(project_key)
+            except Exception as e:
+                self.logger.log(
+                    f"[ZephyrSquad] Jira version lookup failed for {project_key}: {e}",
+                    "warning",
+                )
+                self._version_names[project_key] = {}
+        return self._version_names[project_key]
+
+    def resolve_issue_keys(self, issue_ids: list) -> dict:
+        """Numeric Jira issue ids → keys, cached. Empty when Jira is disabled."""
+        if not self.jira:
+            return {}
+        pending = [str(i) for i in issue_ids if str(i) not in self._issue_keys]
+        if pending:
+            try:
+                self._issue_keys.update(self.jira.get_issue_keys(pending))
+            except Exception as e:
+                self.logger.log(f"[ZephyrSquad] Issue key resolution failed: {e}", "warning")
+        return {str(i): self._issue_keys[str(i)]
+                for i in issue_ids if str(i) in self._issue_keys}
