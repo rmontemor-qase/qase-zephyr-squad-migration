@@ -211,9 +211,9 @@ the customer's own security team proposes and approves an approach.
   → high, Medium/Normal → medium, Low/Lowest → low; anything else → medium with
   a warning (override via `cases.priority_map`).
 - **Multi-component tests**: a Qase case lives in exactly one suite, so
-  suite-per-component can only represent one component. The per-project
-  component field keeps them all — the recommended pairing is
-  `features.single_suite` + `features.component_custom_field`.
+  suite-per-component can only represent one component (the first match wins).
+  Pick the mode that fits the customer's data — see
+  [Choosing how to organise cases](#choosing-how-to-organise-cases).
 - **Jira issue links**: written to a "Jira Links" text custom field as
   `relationship KEY — url`. Links whose target is another `Test` issue are
   dropped on purpose: they point at test cases that are themselves being
@@ -227,6 +227,33 @@ the customer's own security team proposes and approves an approach.
   silently dropped.
 - Errors and warnings always print to the console, not just the log file.
 - Deterministic 4xx responses fast-fail; `408`/`429`/`5xx`/network errors retry.
+
+## Choosing how to organise cases
+
+Three supported shapes. Start with the default; the others exist for data that
+does not fit it.
+
+**1. Suite per component (default — no config needed).**
+Each Jira component becomes a suite; components are also written as case tags.
+The natural fit when tests carry a single component, and the closest thing to a
+folder tree that classic Squad's flat model allows.
+
+**2. Suite per component + component field** (`features.component_custom_field: true`).
+Keeps the suite tree *and* records **every** component of each test in a
+per-project multiselect field. Choose this when a meaningful share of tests carry
+more than one component: the suite still gives structure, and nothing is lost to
+the one-case-one-folder limit. Components move from tags to the field, which
+keeps Qase's 10-tag cap free for real labels.
+
+**3. Single suite + component field**
+(`features.single_suite: true` + `features.component_custom_field: true`).
+Everything lands in one suite and organisation happens entirely through filtering
+on the component field. Choose this when *most* tests are multi-component (so any
+folder choice would be arbitrary), or when the customer explicitly prefers a flat
+repository they navigate by filter rather than by tree.
+
+To decide, check the source first — the share of tests with more than one
+component is the deciding number, and it varies a lot between projects.
 
 ## Delta migrations
 
