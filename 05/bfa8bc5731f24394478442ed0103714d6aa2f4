@@ -1,0 +1,85 @@
+src/entities/zephyr_squad/fields.py
+  s_3aa670028c7870::t_db94a315a12549 1-401
+README.md
+  s_3aa670028c7870::t_e10294e70c7b68 1-298
+src/entities/zephyr_squad/runs.py
+  s_3aa670028c7870::t_db94a315a12549 1-254
+.gitignore
+  s_3aa670028c7870::t_4538bc336dca83 1-28
+CREDENTIALS.md
+  s_3aa670028c7870::t_db94a315a12549 1-50
+preflight.py
+  s_3aa670028c7870::t_db94a315a12549 1-296
+src/entities/zephyr_squad/cases.py
+  s_3aa670028c7870::t_db94a315a12549 1-409
+config.example.json
+  s_3aa670028c7870::t_346cadecb3bcfc 1-62
+src/entities/zephyr_squad/__init__.py
+  s_3aa670028c7870::t_61f5d98b7146f4 1-17
+src/exceptions/__init__.py
+  s_3aa670028c7870::t_eabb71f50c564a 1-8
+src/exceptions/api.py
+  s_3aa670028c7870::t_19fedb16a5def5 1-2
+src/service/__init__.py
+  s_3aa670028c7870::t_036fc7ea3883df 1-7
+src/service/qase_dry_run.py
+  s_3aa670028c7870::t_a761534f2ccd30 1-104
+src/support/__init__.py
+  s_3aa670028c7870::t_b318a3af5d3fb0 1-15
+src/support/config_manager.py
+  s_3aa670028c7870::t_7e61dfc7a2f80f 1-48
+src/support/html.py
+  s_3aa670028c7870::t_943a9c58778f9e 1-62
+src/support/links.py
+  s_3aa670028c7870::t_4c02f0e9357bff 1-16
+src/support/logger.py
+  s_3aa670028c7870::t_05b1fb130ab5d2 1-54
+src/support/pools.py
+  s_3aa670028c7870::t_526c1554b8d802 1-57
+src/support/stats.py
+  s_3aa670028c7870::t_6231dbb64f0e51 1-127
+src/support/throttled_pool.py
+  s_3aa670028c7870::t_1d401fc2fecfdb 1-46
+src/support/zephyr_session.py
+  s_3aa670028c7870::t_46b05f83a3e08b 1-300
+requirements.txt
+  s_3aa670028c7870::t_df424ff104c157 1-11
+src/api/jira_lookup.py
+  s_3aa670028c7870::t_6ff889156ae39b 1-271
+src/api/zephyr_squad.py
+  s_3aa670028c7870::t_2ebf26a6b17edd 1-384
+src/entities/zephyr_squad/attachments.py
+  s_3aa670028c7870::t_9195a00e21c91b 1-29
+src/entities/zephyr_squad/milestones.py
+  s_3aa670028c7870::t_094fb80d35a5a9 1-28
+src/entities/zephyr_squad/projects.py
+  s_3aa670028c7870::t_7155816e1c172a 1-208
+src/entities/zephyr_squad/suites.py
+  s_3aa670028c7870::t_e2cb8be5e235a0 1-106
+src/importer.py
+  s_3aa670028c7870::t_876c1379a3d8a8 1-244
+src/service/qase.py
+  s_3aa670028c7870::t_fc9e37c8b0fe26 1-1360
+src/service/zephyr_squad.py
+  s_3aa670028c7870::t_b23aec54dd1d85 1-240
+src/support/mappings.py
+  s_3aa670028c7870::t_0dbafb79c1a7de 1-220
+start.py
+  s_3aa670028c7870::t_c55200373bdd41 1-50
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "05bfa8bc5731f24394478442ed0103714d6aa2f4",
+  "prompts": {},
+  "sessions": {
+    "s_3aa670028c7870": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1ec2b924-6256-4011-9ea6-e6d554073d8e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "rmontemor-qase <rmontemor@qase.io>"
+    }
+  }
+}
