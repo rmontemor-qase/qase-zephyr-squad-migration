@@ -1,0 +1,19 @@
+README.md
+  s_3aa670028c7870::t_f0e0ec0eead4a3 214-216,231-257
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "7a485e2e23027781bcc482c6340f55ed06b89862",
+  "prompts": {},
+  "sessions": {
+    "s_3aa670028c7870": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1ec2b924-6256-4011-9ea6-e6d554073d8e",
+        "model": "unknown"
+      },
+      "human_author": "rmontemor-qase <rmontemor@qase.io>"
+    }
+  }
+}
