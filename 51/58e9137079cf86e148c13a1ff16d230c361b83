@@ -1,0 +1,45 @@
+src/service/zephyr_squad.py
+  s_452c21d38c3f71::t_2b0324501686b8 229-249
+src/support/mappings.py
+  s_452c21d38c3f71::t_378c04f62aab03 28-33
+src/service/qase.py
+  s_452c21d38c3f71::t_7729eed4b0a50a 1324-1349
+src/entities/zephyr_squad/milestones.py
+  s_452c21d38c3f71::t_df3910dbf7c515 2
+  s_452c21d38c3f71::t_b93ece144ebe74 109
+  s_452c21d38c3f71::t_a8e3521f8ba4cd 44-56
+  s_452c21d38c3f71::t_5a7eafd477e620 1,3,13-22,34-35,38-39,42-43,57-108,110-134
+src/service/qase_dry_run.py
+  s_452c21d38c3f71::t_b148268d583443 38-40,43
+  s_452c21d38c3f71::t_2ac32cd6248d91 84-88,90-91
+src/api/jira_lookup.py
+  s_452c21d38c3f71::t_d42821ceeb442b 104-124
+src/api/zephyr_squad.py
+  s_452c21d38c3f71::t_16c2d41e499902 156-183
+src/entities/zephyr_squad/runs.py
+  s_452c21d38c3f71::t_38424cc78b5dce 158-170
+  s_452c21d38c3f71::t_6101d07eea2ae5 267-271,274-276
+  s_452c21d38c3f71::t_acab00700c3087 216-234
+  s_452c21d38c3f71::t_f8bea4038a2187 178-179,181-186
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "5158e9137079cf86e148c13a1ff16d230c361b83",
+  "prompts": {},
+  "humans": {
+    "h_cfb642ecaccda9": {
+      "author": "rmontemor-qase <rmontemor@qase.io>"
+    }
+  },
+  "sessions": {
+    "s_452c21d38c3f71": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d75b834b-378c-43fd-92e0-ed051183e4b1",
+        "model": "claude-opus-5"
+      },
+      "human_author": "rmontemor-qase <rmontemor@qase.io>"
+    }
+  }
+}
