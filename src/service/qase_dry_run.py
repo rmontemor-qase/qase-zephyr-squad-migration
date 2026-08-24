@@ -35,9 +35,12 @@ class DryRunQaseService(QaseService):
 
     def create_run(self, run, project_code, cases=[], milestone_id=None):
         env = f", environment_id={run.get('environment_id')}" if run.get("environment_id") else ""
+        # Surface milestone_id: run -> fix-version traceability is otherwise
+        # invisible in a dry run, so it could not be validated before a real run.
+        ms = f", milestone_id={milestone_id}" if milestone_id else ", milestone=NONE"
         self._dry(
             f"[{project_code}] would create run {run.get('name')!r} with "
-            f"{len(cases)} case(s){env}"
+            f"{len(cases)} case(s){env}{ms}"
         )
         return next(self._fake_ids)
 
@@ -78,8 +81,14 @@ class DryRunQaseService(QaseService):
         self._dry(f"[{project_code}] would create environment {title!r}")
         return next(self._fake_ids)
 
+    def get_milestones(self, project_code: str) -> dict:
+        # Dry run: pretend the target has none, so every version is reported as
+        # "would create" rather than silently treated as already present.
+        return {}
+
     def create_milestone(self, project_code, title, description, status, due_date):
-        self._dry(f"[{project_code}] would create milestone {title!r}")
+        self._dry(f"[{project_code}] would create milestone {title!r} "
+                  f"(due={due_date or 'none'})")
         return next(self._fake_ids)
 
     def create_configuration_group(self, project_code, title):

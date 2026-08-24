@@ -101,6 +101,27 @@ class JiraLookupClient:
             if v.get("id") is not None
         }
 
+    def get_versions(self, project_key: str) -> list:
+        """Full fix-version records, for Jira version → Qase milestone mapping.
+
+        Returns ``[{"id", "name", "description", "release_date", "released"}]``.
+        ``release_date`` is Jira's ``releaseDate`` (YYYY-MM-DD) or None, and maps
+        onto the Qase milestone due date.
+        """
+        versions = self._get(f"rest/api/{self.api_version}/project/{project_key}/versions") or []
+        out = []
+        for v in versions:
+            if v.get("id") is None:
+                continue
+            out.append({
+                "id": str(v["id"]),
+                "name": (v.get("name") or "").strip(),
+                "description": (v.get("description") or "").strip(),
+                "release_date": v.get("releaseDate") or None,
+                "released": bool(v.get("released")),
+            })
+        return out
+
     # ------------------------------------------------------------------
     # Test-issue enumeration (classic Squad tests = Jira issues)
     # ------------------------------------------------------------------

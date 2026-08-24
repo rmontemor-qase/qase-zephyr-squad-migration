@@ -25,6 +25,12 @@ class Mappings:
         # native external-issue attach is unavailable (no Jira integration)
         self.jira_links_field_id = None
 
+        # Jira fix version -> Qase milestone, per project:
+        #   {project_code: {version_id(str): milestone_id(int)}}
+        # Populated by the Milestones phase, consumed when creating runs so each
+        # run is attached to the release it belongs to.
+        self.version_to_milestone: dict = {}
+
         # features.component_custom_field: per-project multiselect CF holding the
         # Jira components of each test. One field PER project (scoped to it), so
         # each project keeps its own component taxonomy:

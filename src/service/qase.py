@@ -1321,6 +1321,32 @@ class QaseService:
             )
             return False
 
+    def get_milestones(self, project_code: str) -> dict:
+        """{title_lower: milestone_id} for a project, so a re-run reuses instead of
+        duplicating. Milestones are one of the few entities Qase lets us dedupe."""
+        out = {}
+        api = MilestonesApi(self.client)
+        offset = 0
+        while True:
+            try:
+                resp = api.get_milestones(code=project_code, limit=100, offset=offset)
+            except Exception as e:
+                self.logger.log(
+                    f"[Qase][Milestones] {project_code}: list failed: {e}"[:300], "warning"
+                )
+                break
+            entities = getattr(getattr(resp, "result", None), "entities", None) or []
+            for m in entities:
+                title = (getattr(m, "title", "") or "").strip().lower()
+                mid = getattr(m, "id", None)
+                if title and mid is not None:
+                    out[title] = int(mid)
+            total = getattr(getattr(resp, "result", None), "total", None)
+            offset += len(entities)
+            if not entities or (total is not None and offset >= int(total)):
+                break
+        return out
+
     def create_milestone(self, project_code, title, description, status, due_date):
         data = {
             'project_code': project_code,

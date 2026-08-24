@@ -226,6 +226,27 @@ class ZephyrSquadService:
                 self._version_names[project_key] = {}
         return self._version_names[project_key]
 
+    def get_versions(self, project_key: str) -> list:
+        """Full Jira fix-version records (id/name/description/release_date/released).
+
+        Used by the Milestones phase; ZAPI Cloud has no version endpoint, so this
+        comes from Jira like the names above. Returns [] when Jira is unconfigured.
+        """
+        if not self.jira:
+            self.logger.log(
+                "[ZephyrSquad] Cannot read fix versions — Jira read client is disabled",
+                "warning",
+            )
+            return []
+        try:
+            return self.jira.get_versions(project_key)
+        except Exception as e:
+            self.logger.log(
+                f"[ZephyrSquad] Jira version lookup failed for {project_key}: {e}",
+                "warning",
+            )
+            return []
+
     def resolve_issue_keys(self, issue_ids: list) -> dict:
         """Numeric Jira issue ids → keys, cached. Empty when Jira is disabled."""
         if not self.jira:

@@ -155,7 +155,19 @@ class Runs:
                         self.zephyr.get_executions_by_issue, issue_id, project_id
                     )
                 except Exception as e:
-                    self.logger.log(f"[{code}][Runs] executions fetch failed for {issue_id}: {e}", "warning")
+                    # Fail LOUD: this drops one test's executions entirely, so it
+                    # is data loss, not a degradation. As a warning it never
+                    # reached the migration report and the run still claimed
+                    # success. Record it so the report lists exactly what was lost.
+                    self.logger.log(
+                        f"[{code}][Runs] executions fetch failed for {issue_id}: {e}", "error"
+                    )
+                    self.mappings.stats.add_issue(
+                        code, "run",
+                        f"issue {issue_id}: executions fetch FAILED — this test's "
+                        f"run results were NOT migrated ({e})",
+                        "error",
+                    )
                     execs = None
                 for item in execs or []:
                     ex = item.get("execution", item) if isinstance(item, dict) else {}
@@ -163,8 +175,15 @@ class Runs:
                     if cid is None:
                         continue
                     cyc = cycles.setdefault(
-                        cid, {"name": ex.get("cycleName") or f"Cycle {cid}", "results": [], "ts": []}
+                        cid, {"name": ex.get("cycleName") or f"Cycle {cid}",
+                              "results": [], "ts": [], "version_id": None}
                     )
+                    # Jira fix version of this cycle -> Qase milestone (release
+                    # traceability). -1 is Zephyr's "Unscheduled", i.e. no version.
+                    if cyc.get("version_id") is None:
+                        vid = ex.get("versionId")
+                        if vid is not None and str(vid) != "-1":
+                            cyc["version_id"] = str(vid)
                     sec = self._sec(ex.get("executedOn"))
                     if sec:
                         cyc["ts"].append(sec)
@@ -193,6 +212,25 @@ class Runs:
 
         self.logger.log(f"[{code}][Runs] {len(cycles)} cycle(s) with executions")
         self.mappings.stats.add_entity_count(code, "runs", "zephyr-squad", len(cycles))
+
+        # Milestone coverage: how many cycles carry a Jira fix version we can map.
+        # Reported up front so a mapping problem is visible before any run is
+        # created, rather than being inferred from the target afterwards.
+        ms_map = self.mappings.version_to_milestone.get(code) or {}
+        with_version = [c for c in cycles.values() if c.get("version_id")]
+        mapped = [c for c in with_version if ms_map.get(c.get("version_id"))]
+        unmapped = [c for c in with_version if not ms_map.get(c.get("version_id"))]
+        self.logger.log(
+            f"[{code}][Runs] milestones: {len(mapped)}/{len(cycles)} cycle(s) will be "
+            f"attached ({len(cycles) - len(with_version)} unscheduled, "
+            f"{len(unmapped)} with a version but no milestone)"
+        )
+        if unmapped:
+            missing = sorted({c.get("version_id") for c in unmapped})
+            self.logger.log(
+                f"[{code}][Runs] fix version(s) with no milestone: {missing[:10]} — "
+                f"those runs lose release traceability", "warning",
+            )
 
         # Resolve who executed each test onto existing Qase users BEFORE creating
         # runs, so result authorship is retained (executions carry only an
@@ -226,9 +264,16 @@ class Runs:
                 "created_on": created_on, "completed_on": completed_on,
                 "author_id": self.mappings.default_user, "is_completed": True,
             }
+            # Attach the run to the milestone for its cycle's Jira fix version.
+            # None for Unscheduled cycles or when the version has no milestone.
+            milestone_id = (self.mappings.version_to_milestone.get(code) or {}).get(
+                cyc.get("version_id")
+            )
             async with run_sem:
                 try:
-                    qase_run_id = await self.pools.qs(self.qase.create_run, run, code, [], None)
+                    qase_run_id = await self.pools.qs(
+                        self.qase.create_run, run, code, [], milestone_id
+                    )
                 except Exception as e:
                     self.logger.log(f"[{code}][Runs] create_run failed for {title!r}: {e}", "error")
                     return

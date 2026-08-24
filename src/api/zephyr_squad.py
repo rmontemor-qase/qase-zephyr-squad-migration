@@ -153,8 +153,34 @@ class ZephyrSquadApiClient:
                 if response.status_code == 200:
                     try:
                         return response.json()
-                    except (ValueError, requests.exceptions.JSONDecodeError) as e:
-                        raise APIError(f"Non-JSON response from {path!r}") from e
+                    except (ValueError, requests.exceptions.JSONDecodeError):
+                        # ZAPI intermittently answers a 200 with a NON-JSON body
+                        # under sustained concurrent load (observed heavily on
+                        # large projects: ~70% of /executions calls on an 8k-case
+                        # project). This is transient, so treat it like 429/5xx and
+                        # retry. Raising here would hit `except APIError: raise`
+                        # below and fail permanently on the first occurrence —
+                        # which silently discarded one test's executions per hit.
+                        if attempt == self.max_retries:
+                            raise APIError(
+                                f"Non-JSON response from {path!r} after "
+                                f"{self.max_retries + 1} attempt(s) "
+                                f"(len={len(response.content)}, "
+                                f"content-type={response.headers.get('Content-Type')!r}): "
+                                f"{response.text[:200]!r}"
+                            )
+                        _wait = min(self.backoff_factor * (2 ** attempt), 30.0)
+                        if attempt >= 1 and self.logger:
+                            # Quiet on the first retry (usually enough); surface
+                            # persistent cases so a systemic problem is visible.
+                            self.logger.log(
+                                f"[ZAPI] non-JSON 200 on {path!r}; retrying in "
+                                f"{_wait:.0f}s (attempt {attempt + 1}/"
+                                f"{self.max_retries + 1})",
+                                "warning",
+                            )
+                        time.sleep(_wait)
+                        continue
                 if 400 <= response.status_code < 500 and response.status_code not in (408, 429):
                     raise APIError(
                         f"HTTP {response.status_code} (non-retryable) for {path!r}: "
