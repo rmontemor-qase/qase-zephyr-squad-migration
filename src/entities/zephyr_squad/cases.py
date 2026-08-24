@@ -47,6 +47,9 @@ class Cases:
     def import_cases(self, project: dict):
         self._warned_priorities = set()
         self._warned_components = set()
+        self._warned_no_labels_field = False
+        self._warned_labels = set()
+        self._max_tags_seen = 0
         self._current_code = project.get("code")
         _pid = self.config.get("cases.preserve_ids")
         self._preserve_ids = True if _pid is None else bool(_pid)
@@ -285,13 +288,42 @@ class Cases:
                     str(o) for o in option_ids
                 )
 
-        # tags = Jira labels (+ component names only when the component field is
-        # NOT carrying them, so labels are never crowded out of Qase's 10-tag cap)
-        tags = [str(t) for t in (fields.get("labels") or []) if t]
-        if not comp_fid:
-            tags += comp_names
-        if tags:
-            data["tags"] = tags[:10]
+        # Jira labels -> the per-project "Labels" MULTISELECT CF, NOT Qase tags.
+        # Same encoding as components: a comma-separated list of option ids, which
+        # is the format Qase requires for multiselect. No tags are sent at all.
+        labels = [str(t).strip() for t in (fields.get("labels") or []) if t]
+        lab_cf = self.mappings.labels_field.get(self._current_code) or {}
+        lab_fid, lab_opts = lab_cf.get("field_id"), lab_cf.get("options") or {}
+        if labels and lab_fid and lab_opts:
+            option_ids = []
+            for name in labels:
+                oid = lab_opts.get(name.strip().lower())
+                if oid is not None and oid not in option_ids:
+                    option_ids.append(oid)
+                elif oid is None:
+                    self._warn_missing_label(name)
+            if option_ids:
+                data.setdefault("custom_field", {})[str(lab_fid)] = ",".join(
+                    str(o) for o in option_ids
+                )
+        elif labels and lab_fid is None and not self._labels_cf_enabled():
+            # features.labels_custom_field is OFF -> fall back to native Qase tags,
+            # which is the historical behaviour.
+            tags = list(labels)
+            if not comp_fid:
+                tags += comp_names
+            if tags:
+                if len(tags) > 10:
+                    # Qase caps a case at 10 tags and silently drops the rest. Say so:
+                    # this quietly lost labels and component names before.
+                    self._warn_tag_overflow(len(tags))
+                data["tags"] = tags[:10]
+        elif labels and not self._warned_no_labels_field:
+            self._warned_no_labels_field = True
+            self.logger.log(
+                f"[{self._current_code}][Cases] 'Labels' CF unavailable — Jira labels "
+                f"are NOT being migrated", "error",
+            )
 
         # Authorship: the Jira reporter (falling back to assignee) matched onto a
         # user that already exists in Qase; unmatched → users.default.
@@ -318,6 +350,67 @@ class Cases:
             if lines:
                 data.setdefault("custom_field", {})[str(fid)] = "\n".join(lines)
 
+        # Jira fix versions -> (a) the case's native milestone_id, and (b) the
+        # "Fix Versions" multiselect CF holding ALL of them.
+        # milestone_id is SINGULAR while cases routinely carry several fix versions
+        # (observed: up to 58 on a single case), so it is only set when there is
+        # unambiguous; the CF always carries the complete set so nothing is lost.
+        fix_versions = fields.get("fixVersions") or []
+        fv_names, fv_ids = [], []
+        for v in fix_versions:
+            if not isinstance(v, dict):
+                continue
+            nm = (v.get("name") or "").strip()
+            if nm:
+                fv_names.append(nm)
+            if v.get("id") is not None:
+                fv_ids.append(str(v["id"]))
+
+        # features.case_milestone (default OFF): set the case's native milestone_id
+        # when — and only when — there is exactly one fix version. It is a singular
+        # field while cases routinely carry several (up to 58 observed), so it can
+        # otherwise only hold a partial truth. The "Fix Versions" field below always
+        # carries the complete set. Runs get their milestone regardless; that is
+        # where release traceability lives.
+        _cm = self.config.get("features.case_milestone")
+        if (False if _cm is None else bool(_cm)) and len(fv_ids) == 1:
+            ms_id = (self.mappings.version_to_milestone.get(self._current_code) or {}).get(
+                fv_ids[0]
+            )
+            if ms_id:
+                data["milestone_id"] = int(ms_id)
+
+        fv_cf = self.mappings.fixversion_field.get(self._current_code) or {}
+        fv_fid, fv_opts = fv_cf.get("field_id"), fv_cf.get("options") or {}
+        if fv_names and fv_fid and fv_opts:
+            option_ids = []
+            for name in fv_names:
+                oid = fv_opts.get(name.strip().lower())
+                if oid is not None and oid not in option_ids:
+                    option_ids.append(oid)
+            if option_ids:
+                data.setdefault("custom_field", {})[str(fv_fid)] = ",".join(
+                    str(o) for o in option_ids
+                )
+
+        # Arbitrary Jira custom fields mirrored onto the case (cases.jira_custom_fields)
+        for jira_id, cf in (
+            self.mappings.jira_custom_fields.get(self._current_code) or {}
+        ).items():
+            fid, opts = cf.get("field_id"), cf.get("options") or {}
+            if not fid or not opts:
+                continue
+            vals = self._flatten_jira_value(fields.get(jira_id))
+            option_ids = []
+            for v in vals:
+                oid = opts.get(v.strip().lower())
+                if oid is not None and oid not in option_ids:
+                    option_ids.append(oid)
+            if option_ids:
+                data.setdefault("custom_field", {})[str(fid)] = ",".join(
+                    str(o) for o in option_ids
+                )
+
         # Fixed values for the target's REQUIRED custom fields (Zephyr has no
         # equivalent data). Per project, since a field only exists in the projects
         # it is scoped to. setdefault: never override a value we actually migrated.
@@ -328,6 +421,58 @@ class Cases:
 
         data["is_flaky"] = 0
         return TestCasebulkCasesInner(**data)
+
+    @staticmethod
+    def _flatten_jira_value(raw) -> list:
+        """Jira custom-field value -> list of display strings.
+
+        Custom fields come back as a scalar, an option dict ({"value": ...}), or a
+        list of either, so every shape has to be handled or values are dropped.
+        """
+        if raw is None:
+            return []
+        if isinstance(raw, list):
+            out = []
+            for item in raw:
+                out.extend(Cases._flatten_jira_value(item))
+            return out
+        if isinstance(raw, dict):
+            for k in ("value", "name", "displayName"):
+                if raw.get(k):
+                    return [str(raw[k]).strip()]
+            return []
+        return [str(raw).strip()]
+
+    def _labels_cf_enabled(self) -> bool:
+        v = self.config.get("features.labels_custom_field")
+        return True if v is None else bool(v)
+
+    def _warn_tag_overflow(self, n: int) -> None:
+        """Warn once per project when a case exceeds Qase's 10-tag cap.
+
+        The cap truncates silently, so labels and component names simply vanished
+        with no record. Reported once with the worst count seen."""
+        if n > getattr(self, "_max_tags_seen", 0):
+            self._max_tags_seen = n
+            self.logger.log(
+                f"[{self._current_code}][Cases] a case carries {n} tag(s) but Qase "
+                f"keeps only 10 — the rest are dropped. Consider "
+                f"features.labels_custom_field to migrate labels without a cap.",
+                "warning",
+            )
+
+    def _warn_missing_label(self, name: str) -> None:
+        """Warn once per label that has no option in the Labels field, e.g. a label
+        added in Jira between the option scan and the case import. Without this the
+        label would be dropped silently."""
+        key = (name or "").strip().lower()
+        if key and key not in self._warned_labels:
+            self._warned_labels.add(key)
+            self.logger.log(
+                f"[{self._current_code}][Cases] Jira label {name!r} has no matching "
+                f"option in the 'Labels' field — not migrated for affected case(s)",
+                "warning",
+            )
 
     def _warn_missing_components(self, comp_names: list) -> None:
         """Warn once per component name that has no option in the component field

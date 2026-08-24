@@ -17,7 +17,11 @@
         "component_field_fallback_option": "No Feature Area",
         "single_suite": false,
         "single_suite_title": "Migrated from Zephyr",
-        "required_field_defaults": {}
+        "required_field_defaults": {},
+        "shared_option_fields": true,
+        "labels_custom_field": true,
+        "fixversion_custom_field": true,
+        "case_milestone": false
     },
     "zephyr": {
         "account_id": "<ATLASSIAN_ACCOUNT_ID>",
@@ -47,7 +51,10 @@
         "jira_statuses": [],
         "preserve_ids": true,
         "limit": 0,
-        "batch_size": 50
+        "batch_size": 50,
+        "jira_custom_fields": {
+            "customfield_XXXXX": "Qase Field Title"
+        }
     },
     "runs": {
         "status_map": {},

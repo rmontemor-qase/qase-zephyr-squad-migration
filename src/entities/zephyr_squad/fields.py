@@ -91,8 +91,17 @@ class Fields:
         # 3 — ensure the "Jira Reference" custom field exists on the target projects
         await self._ensure_jira_ref_field()
 
-        # 4 — per-project component field ("Feature Area"), feature-flagged
+        # 4 — SHARED component field ("Components"), feature-flagged
         await self._ensure_component_field()
+
+        # 4b — SHARED "Labels" multiselect: Jira labels land here, not in tags
+        await self._ensure_labels_field()
+
+        # 4c — SHARED "Fix Versions" multiselect (milestone_id is singular)
+        await self._ensure_fixversion_field()
+
+        # 4d — arbitrary Jira custom fields, per cases.jira_custom_fields
+        await self._ensure_jira_custom_fields()
 
         # 5 — fixed values for the target's REQUIRED custom fields
         await self._ensure_required_field_defaults()
@@ -132,6 +141,216 @@ class Fields:
         payload = {"title": (getattr(cf, "title", "") or "").strip(), "value": value}
         payload.update(self._field_flags(cf))
         return bool(await self.pools.qs(self.qase.update_custom_field, cf_id, payload))
+
+    def _labels_custom_field(self) -> bool:
+        """features.labels_custom_field — Jira labels go to a 'Labels' custom field
+        instead of Qase tags. True by default: Qase caps a case at 10 tags and
+        silently drops the rest, which loses data on tests carrying many labels."""
+        v = self.config.get("features.labels_custom_field")
+        return True if v is None else bool(v)
+
+    def _fixversion_custom_field(self) -> bool:
+        """features.fixversion_custom_field — a 'Fix Versions' custom field holding
+        ALL of a case's Jira fix versions. True by default, because a case's native
+        milestone_id is singular and cases routinely carry several."""
+        v = self.config.get("features.fixversion_custom_field")
+        return True if v is None else bool(v)
+
+    def _shared_option_fields(self) -> bool:
+        """features.shared_option_fields — one option field across all projects.
+
+        True (default): a single field per concept (Components/Labels/Fix
+        Versions) scoped to every target project, options being the union. Enables
+        cross-project filtering, at the cost of each project's picker also listing
+        other projects' values.
+
+        False: one field PER project, scoped to it alone and carrying only its own
+        values. Cleaner pickers, but the same-titled fields cannot be queried
+        together.
+
+        NOTE for existing installs: with True, a pre-existing per-project field of
+        the same title is found and has its scope and options EXTENDED to cover all
+        target projects, which merges taxonomies. Set False to keep them separate.
+        """
+        v = self.config.get("features.shared_option_fields")
+        return True if v is None else bool(v)
+
+    async def _ensure_option_field(self, title: str, names_by_project: dict) -> dict:
+        """Create/extend the option field(s) for a concept, per features.shared_option_fields.
+
+        Returns ``{project_code: {"field_id": int, "options": {name_lower: id}}}``.
+        """
+        if self._shared_option_fields():
+            names = sorted({n for v in names_by_project.values() for n in v})
+            result = await self._ensure_shared_multiselect(title, names)
+            return {code: result for code in names_by_project if result}
+        out = {}
+        for code, names in names_by_project.items():
+            r = await self._ensure_shared_multiselect(title, sorted(names), only_code=code)
+            if r:
+                out[code] = r
+        return out
+
+    async def _ensure_shared_multiselect(self, title: str, names: list,
+                                         only_code: str = None) -> dict:
+        """Create or extend a multiselect option field.
+
+        ``only_code`` set  -> PER-PROJECT: scoped to that project alone, and an
+        existing field is reused only if already scoped to it (a workspace-global
+        field of the same name is never hijacked).
+        ``only_code`` None -> SHARED: scoped to every target project, options being
+        the union. Scope and options are only ever GROWN, never shrunk.
+
+        Returns ``{"field_id": int, "options": {name_lower: option_id}}``, or {}.
+        """
+        codes = ([only_code] if only_code else
+                 sorted({p["code"] for p in self.mappings.projects if p.get("code")}))
+        if not names or not codes:
+            return {}
+
+        try:
+            existing = await self.pools.qs(self.qase.get_case_custom_fields) or []
+        except Exception as e:
+            self.logger.log(f"[Fields] Could not list Qase custom fields: {e}", "warning")
+            existing = []
+
+        match = None
+        for cf in existing:
+            if (getattr(cf, "title", "") or "").strip().lower() != title.lower():
+                continue
+            if only_code:
+                # Per-project: only reuse a field already scoped to THIS project.
+                if bool(getattr(cf, "is_enabled_for_all_projects", False)):
+                    continue
+                if only_code not in [str(c) for c in (getattr(cf, "projects_codes", None) or [])]:
+                    continue
+            match = cf
+            break
+
+        if match is None:
+            cf_id = await self.pools.qs(self.qase.create_custom_field, {
+                "title": title, "entity": 0,
+                "type": self.mappings.qase_fields_type["multiselect"],
+                "is_required": False, "is_visible": True, "is_filterable": True,
+                "is_enabled_for_all_projects": False, "projects_codes": codes,
+                "value": [{"title": n} for n in names],
+            })
+            if not cf_id:
+                self.logger.log(
+                    f"[Fields] Could not create shared '{title}' field — those values "
+                    f"will NOT be migrated", "error",
+                )
+                return {}
+            self.logger.log(
+                f"[Fields] Created shared '{title}' CF (id={cf_id}) with {len(names)} "
+                f"option(s), scoped to {codes}"
+            )
+        else:
+            cf_id = int(getattr(match, "id"))
+            current = await self.pools.qs(self.qase.get_custom_field_options, cf_id) or []
+            have = {o["title"].strip().lower() for o in current}
+            missing = [n for n in names if n.lower() not in have]
+
+            # Scope must include every target project or Qase rejects the whole case
+            # with "The field name is not valid." Merge, never shrink.
+            is_global = bool(getattr(match, "is_enabled_for_all_projects", False))
+            have_codes = [str(c) for c in (getattr(match, "projects_codes", None) or [])]
+            new_codes = [c for c in codes if c not in have_codes]
+
+            if missing or (new_codes and not is_global):
+                value = [{"id": o["id"], "title": o["title"]} for o in current]
+                value += [{"title": t} for t in missing]
+                payload = {"title": title, "value": value}
+                payload.update(self._field_flags(match))
+                if not is_global:
+                    payload["projects_codes"] = have_codes + new_codes
+                ok = bool(await self.pools.qs(self.qase.update_custom_field, cf_id, payload))
+                self.logger.log(
+                    f"[Fields] {'Extended' if ok else 'FAILED to extend'} shared '{title}' "
+                    f"CF (id={cf_id}): +{len(missing)} option(s), scope +{new_codes or 'none'}",
+                    "info" if ok else "error",
+                )
+            else:
+                self.logger.log(
+                    f"[Fields] Reusing shared '{title}' CF (id={cf_id}) — nothing to add"
+                )
+
+        option_list = await self.pools.qs(self.qase.get_custom_field_options, cf_id) or []
+        options = {o["title"].strip().lower(): o["id"] for o in option_list}
+        if not options:
+            self.logger.log(
+                f"[Fields] '{title}' (id={cf_id}) returned no options — those values "
+                f"will be skipped", "warning",
+            )
+        return {"field_id": int(cf_id), "options": options}
+
+    async def _ensure_fixversion_field(self):
+        """SHARED multiselect CF holding ALL of a case's Jira fix versions.
+
+        The case also gets ``milestone_id`` set (see Cases), but that is SINGULAR
+        while cases routinely carry several fix versions (observed: up to 58) —
+        so the milestone alone would silently drop all but one. This field keeps
+        every value; the milestone gives native Qase filtering when unambiguous.
+        """
+        if not self._fixversion_custom_field():
+            return
+        title = "Fix Versions"
+        by_project = {}
+        for project in self.mappings.projects:
+            code, zephyr_key = project.get("code"), project.get("zephyr_key")
+            if not code or not zephyr_key:
+                continue
+            names = {(v.get("name") or "").strip()
+                     for v in (await self.pools.source(self.zephyr.get_versions, zephyr_key) or [])
+                     if (v.get("name") or "").strip()}
+            if names:
+                by_project[code] = names
+        if not by_project:
+            self.logger.log(f"[Fields] No Jira fix versions — skipping '{title}' field")
+            return
+        self.mappings.fixversion_field.update(await self._ensure_option_field(title, by_project))
+
+    async def _ensure_jira_custom_fields(self):
+        """Mirror arbitrary Jira custom fields onto Qase cases.
+
+        Driven by ``cases.jira_custom_fields``: {jira_field_id: qase_field_title},
+        e.g. {"customfield_10123": "Environment"}. Options are discovered from the
+        values actually present on the migrated test issues, since a Jira custom
+        field's allowed values are not reliably readable per project.
+        """
+        mapping = self.config.get("cases.jira_custom_fields") or {}
+        if not mapping:
+            return
+        for jira_id, qase_title in mapping.items():
+            jira_id = str(jira_id).strip()
+            qase_title = str(qase_title).strip()
+            if not jira_id or not qase_title:
+                continue
+            by_project = {}
+            for project in self.mappings.projects:
+                code, zephyr_key = project.get("code"), project.get("zephyr_key")
+                if not code or not zephyr_key:
+                    continue
+                vals = await self.pools.source(
+                    self.zephyr.get_distinct_custom_field_values, zephyr_key, jira_id
+                ) or []
+                if vals:
+                    by_project[code] = set(vals)
+            names = {n for v in by_project.values() for n in v}
+            if not names:
+                self.logger.log(
+                    f"[Fields] Jira field {jira_id} has no values on the test issues — "
+                    f"skipping '{qase_title}'"
+                )
+                continue
+            per_code = await self._ensure_option_field(qase_title, by_project)
+            if not per_code:
+                continue
+            self.logger.log(
+                f"[Fields] '{qase_title}' <- Jira {jira_id} ({len(names)} distinct value(s))"
+            )
+            for code, result in per_code.items():
+                self.mappings.jira_custom_fields.setdefault(code, {})[jira_id] = result
 
     _OPTION_FIELD_TYPES = ("selectbox", "multiselect", "radio")
 
@@ -264,95 +483,36 @@ class Fields:
         )
 
     async def _ensure_component_field(self):
-        """Create (or reuse) a PER-PROJECT multiselect custom field holding each
-        test's Jira components — feature flag ``features.component_custom_field``.
+        """One SHARED multiselect custom field holding each test's Jira components
+        — feature flag ``features.component_custom_field``.
 
-        One field per Qase project, scoped to that project only, whose options are
-        that project's Jira component names. This is deliberately NOT a single
-        workspace-wide field: each project keeps its own component taxonomy.
-        A pre-existing field with the same title that is enabled for ALL projects
-        (e.g. a customer's own global field) is never reused — only a field already
-        scoped to this project is.
+        Shared across every target project rather than one field per project, so
+        the workspace keeps a single component taxonomy. Options are the union of
+        all migrated projects' Jira component names, accumulated across runs.
         """
         if not bool(self.config.get("features.component_custom_field")):
             return
         title = str(self.config.get("features.component_field_title") or "Feature Area").strip()
-        try:
-            existing = await self.pools.qs(self.qase.get_case_custom_fields) or []
-        except Exception as e:
-            self.logger.log(f"[Fields] Could not list Qase custom fields: {e}", "warning")
-            existing = []
 
+        fallback = str(self.config.get("features.component_field_fallback_option") or "").strip()
+        by_project = {}
         for project in self.mappings.projects:
             code, zephyr_key = project.get("code"), project.get("zephyr_key")
             if not code or not zephyr_key:
                 continue
             components = await self.pools.source(self.zephyr.get_component_names, zephyr_key) or {}
-            names = sorted({(n or "").strip() for n in components.values() if (n or "").strip()})
+            names = {(n or "").strip() for n in components.values() if (n or "").strip()}
             if not names:
-                self.logger.log(
-                    f"[{code}][Fields] No Jira components — skipping '{title}' field", "warning"
-                )
                 continue
-            # Placeholder option for tests that carry no Jira component at all
-            fallback = str(
-                self.config.get("features.component_field_fallback_option") or ""
-            ).strip()
+            # Placeholder option for tests carrying no Jira component at all
             if fallback and fallback.lower() not in {n.lower() for n in names}:
-                names.append(fallback)
+                names.add(fallback)
+            by_project[code] = names
 
-            cf_id, current, reuse_cf = None, [], None
-            for cf in existing:
-                if (getattr(cf, "title", "") or "").strip().lower() != title.lower():
-                    continue
-                if bool(getattr(cf, "is_enabled_for_all_projects", False)):
-                    continue  # a global field of the same name is NOT our per-project one
-                codes = [str(c) for c in (getattr(cf, "projects_codes", None) or [])]
-                if code in codes:
-                    cf_id = int(getattr(cf, "id"))
-                    reuse_cf = cf
-                    current = await self.pools.qs(self.qase.get_custom_field_options, cf_id) or []
-                    break
-
-            if cf_id is None:
-                cf_id = await self.pools.qs(self.qase.create_custom_field, {
-                    "title": title, "entity": 0,
-                    "type": self.mappings.qase_fields_type["multiselect"],
-                    "is_required": False, "is_visible": True, "is_filterable": True,
-                    "is_enabled_for_all_projects": False, "projects_codes": [code],
-                    "value": [{"title": n} for n in names],
-                })
-                if not cf_id:
-                    self.logger.log(
-                        f"[{code}][Fields] Could not create '{title}' field — components "
-                        f"will not be migrated for this project", "error",
-                    )
-                    continue
-                self.logger.log(
-                    f"[{code}][Fields] Created per-project '{title}' CF (id={cf_id}) "
-                    f"with {len(names)} component option(s)"
-                )
-            else:
-                have = {o["title"].strip().lower() for o in current}
-                missing = [n for n in names if n.lower() not in have]
-                if missing:
-                    ok = await self._add_field_options(reuse_cf, cf_id, missing)
-                    self.logger.log(
-                        f"[{code}][Fields] {'Added' if ok else 'FAILED to add'} "
-                        f"{len(missing)} new component option(s) to '{title}' (id={cf_id})",
-                        "info" if ok else "warning",
-                    )
-                else:
-                    self.logger.log(f"[{code}][Fields] Reusing per-project '{title}' CF (id={cf_id})")
-
-            option_list = await self.pools.qs(self.qase.get_custom_field_options, cf_id) or []
-            options = {o["title"].strip().lower(): o["id"] for o in option_list}
-            if not options:
-                self.logger.log(
-                    f"[{code}][Fields] '{title}' (id={cf_id}) returned no options — "
-                    f"component values will be skipped", "warning",
-                )
-            self.mappings.component_field[code] = {"field_id": int(cf_id), "options": options}
+        if not by_project:
+            self.logger.log(f"[Fields] No Jira components — skipping '{title}' field", "warning")
+            return
+        self.mappings.component_field.update(await self._ensure_option_field(title, by_project))
 
     async def _ensure_jira_ref_field(self):
         """Create (or reuse) a text custom field 'Jira Links' scoped to the target
@@ -398,4 +558,30 @@ class Fields:
             self.mappings.jira_links_field_id = cf_id
             self.logger.log(f"[Fields] Created '{title}' CF (id={cf_id})")
         else:
-            self.logger.log("[Fields] Could not create 'Jira Reference' CF", "warning")
+            self.logger.log(f"[Fields] Could not create '{title}' CF", "error")
+
+    async def _ensure_labels_field(self):
+        """One SHARED multiselect custom field holding each test's Jira labels.
+
+        Replaces Qase tags entirely (tags capped at 10 and silently dropped
+        values). Shared across projects so the workspace has a single label
+        taxonomy. Options must exist before any case is created, and Jira has no
+        endpoint listing a project's labels, so they come from a labels-only issue
+        scan; the option set is the union across migrated projects.
+        """
+        if not self._labels_custom_field():
+            return
+        title = "Labels"
+        by_project = {}
+        for project in self.mappings.projects:
+            code, zephyr_key = project.get("code"), project.get("zephyr_key")
+            if not code or not zephyr_key:
+                continue
+            found = await self.pools.source(self.zephyr.get_distinct_labels, zephyr_key) or []
+            if found:
+                by_project[code] = set(found)
+
+        if not by_project:
+            self.logger.log(f"[Fields] No Jira labels found — skipping '{title}' field")
+            return
+        self.mappings.labels_field.update(await self._ensure_option_field(title, by_project))

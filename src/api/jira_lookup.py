@@ -137,6 +137,7 @@ class JiraLookupClient:
         "assignee",
         "reporter",
         "issuelinks",  # test → story/bug/etc. traceability (excl. test-to-test)
+        "fixVersions",  # -> case milestone_id + the "Fix Versions" custom field
     ]
 
     @staticmethod

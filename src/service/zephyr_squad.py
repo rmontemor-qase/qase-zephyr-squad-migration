@@ -151,8 +151,16 @@ class ZephyrSquadService:
                 "[ZephyrSquad] Cannot fetch test issues — Jira client disabled", "error"
             )
             return
+        # Also request any Jira custom fields the config asks us to mirror, or the
+        # case builder would never see them (the default projection omits them).
+        extra = [str(k).strip() for k in (self.config.get("cases.jira_custom_fields") or {})
+                 if str(k).strip()]
+        fields = None
+        if extra:
+            fields = list(self.jira._TEST_ISSUE_FIELDS) + extra
         yield from self.jira.search_test_issues(
-            project_key, issue_type=self.issue_type, statuses=self.issue_statuses
+            project_key, issue_type=self.issue_type, statuses=self.issue_statuses,
+            fields=fields,
         )
 
     def get_issue_attachments(self, issue_id_or_key) -> list:
@@ -225,6 +233,98 @@ class ZephyrSquadService:
                 )
                 self._version_names[project_key] = {}
         return self._version_names[project_key]
+
+    def get_distinct_labels(self, project_key: str) -> list:
+        """Every distinct Jira label used by this project's test issues, sorted.
+
+        Needed because the Labels custom field is a MULTISELECT: its options must
+        exist before any case is created, but labels (unlike components) have no
+        Jira endpoint listing them, so the issues have to be scanned. Cheap: a
+        labels-only JQL projection against Jira, which is not ZAPI rate-limited.
+        """
+        if not self.jira:
+            return []
+        seen = set()
+        pages = 0
+        try:
+            # Same scope as the cases phase (issue type + optional status filter),
+            # so the option set matches exactly the tests that get migrated.
+            for batch in self.jira.search_test_issues(
+                project_key,
+                issue_type=self.issue_type,
+                fields=["labels"],
+                statuses=self.issue_statuses,
+            ):
+                pages += 1
+                for issue in batch:
+                    for lab in ((issue.get("fields") or {}).get("labels") or []):
+                        lab = str(lab).strip()
+                        if lab:
+                            seen.add(lab)
+        except Exception as e:
+            self.logger.log(
+                f"[ZephyrSquad] Label scan failed for {project_key}: {e}"[:300], "warning"
+            )
+            return []
+        self.logger.log(
+            f"[ZephyrSquad] {project_key}: {len(seen)} distinct Jira label(s) "
+            f"across {pages} page(s)"
+        )
+        return sorted(seen)
+
+    def get_distinct_custom_field_values(self, project_key: str, jira_field_id: str) -> list:
+        """Distinct values of a Jira CUSTOM field across this project's test issues.
+
+        Needed because a multiselect Qase field must have its options created before
+        any case is written, and Jira's allowed-values for a custom field are not
+        reliably readable per project. Cheap: one projected JQL scan against Jira,
+        which is not ZAPI rate-limited.
+
+        Handles the shapes Jira returns for custom fields: a scalar, an option dict
+        ({"value": ...}), or a list of either.
+        """
+        if not self.jira:
+            return []
+
+        def flatten(raw):
+            if raw is None:
+                return []
+            if isinstance(raw, list):
+                out = []
+                for item in raw:
+                    out.extend(flatten(item))
+                return out
+            if isinstance(raw, dict):
+                for k in ("value", "name", "displayName"):
+                    if raw.get(k):
+                        return [str(raw[k]).strip()]
+                return []
+            return [str(raw).strip()]
+
+        seen, pages = set(), 0
+        try:
+            for batch in self.jira.search_test_issues(
+                project_key,
+                issue_type=self.issue_type,
+                fields=[jira_field_id],
+                statuses=self.issue_statuses,
+            ):
+                pages += 1
+                for issue in batch:
+                    for v in flatten((issue.get("fields") or {}).get(jira_field_id)):
+                        if v:
+                            seen.add(v)
+        except Exception as e:
+            self.logger.log(
+                f"[ZephyrSquad] Custom-field scan failed for {project_key}/"
+                f"{jira_field_id}: {e}"[:300], "warning",
+            )
+            return []
+        self.logger.log(
+            f"[ZephyrSquad] {project_key}: {len(seen)} distinct value(s) for "
+            f"{jira_field_id} across {pages} page(s)"
+        )
+        return sorted(seen)
 
     def get_versions(self, project_key: str) -> list:
         """Full Jira fix-version records (id/name/description/release_date/released).

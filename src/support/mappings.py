@@ -25,6 +25,24 @@ class Mappings:
         # native external-issue attach is unavailable (no Jira integration)
         self.jira_links_field_id = None
 
+        # "Labels": per-project MULTISELECT CF holding each test's Jira labels.
+        # Replaces Qase tags entirely (tags capped at 10 and silently dropped
+        # values). Same shape as component_field:
+        #   {project_code: {"field_id": int, "options": {label_lower: option_id}}}
+        self.labels_field = {}
+
+        # "Fix Versions": shared multiselect CF holding ALL of a case's Jira fix
+        # versions. Needed because milestone_id on a case is SINGULAR while cases
+        # routinely carry several (observed: up to 58 on a single case), so the
+        # milestone alone cannot represent them without dropping data.
+        #   {project_code: {"field_id": int, "options": {name_lower: option_id}}}
+        self.fixversion_field = {}
+
+        # Arbitrary Jira custom fields -> Qase case custom fields, driven by
+        # config ``cases.jira_custom_fields`` ({jira_field_id: qase_field_title}).
+        #   {project_code: {jira_field_id: {"field_id": int, "options": {...}}}}
+        self.jira_custom_fields = {}
+
         # Jira fix version -> Qase milestone, per project:
         #   {project_code: {version_id(str): milestone_id(int)}}
         # Populated by the Milestones phase, consumed when creating runs so each
