@@ -203,6 +203,7 @@ class Cases:
 
         self.mappings.stats.add_entity_count(code, "cases", "qase", total_created)
         self.logger.log(f"[{code}][Cases] Created {total_created}/{total} case(s) in Qase")
+        self._log_zapi_retries(code, "Cases")
 
     def _build_qase_case(self, issue, suite_map, steps_cache, priority_map, status_map):
         fields = issue.get("fields") or {}
@@ -552,3 +553,15 @@ class Cases:
                 "data": data_field[:1000] if data_field else None,
             })
         return steps
+
+    def _log_zapi_retries(self, code: str, phase: str) -> None:
+        """Report cumulative ZAPI retries so a slow phase is attributable.
+
+        Wall-clock alone cannot distinguish "lots of data" from "ZAPI kept
+        answering 200 with a non-JSON body and we backed off". Silence here
+        means the phase ran clean.
+        """
+        client = getattr(self.zephyr, "client", None)
+        summary = client.retry_summary() if client is not None else ""
+        if summary:
+            self.logger.log(f"[{code}][{phase}] ZAPI retries: {summary}", "warning")

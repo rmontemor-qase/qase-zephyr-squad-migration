@@ -296,4 +296,17 @@ class Runs:
 
         self.mappings.stats.add_entity_count(code, "runs", "qase", created)
         self.logger.log(f"[{code}][Runs] Created {created}/{len(cycles)} run(s) in Qase")
+        self._log_zapi_retries(code, "Runs")
         return self.mappings
+
+    def _log_zapi_retries(self, code: str, phase: str) -> None:
+        """Report cumulative ZAPI retries so a slow phase is attributable.
+
+        Wall-clock alone cannot distinguish "lots of data" from "ZAPI kept
+        answering 200 with a non-JSON body and we backed off". Silence here
+        means the phase ran clean.
+        """
+        client = getattr(self.zephyr, "client", None)
+        summary = client.retry_summary() if client is not None else ""
+        if summary:
+            self.logger.log(f"[{code}][{phase}] ZAPI retries: {summary}", "warning")

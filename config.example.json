@@ -28,7 +28,7 @@
         "access_key": "<ZAPI_ACCESS_KEY>",
         "secret_key": "<ZAPI_SECRET_KEY>",
         "base_url": "https://prod-api.zephyr4jiracloud.com/connect",
-        "max_requests_per_min": 25,
+        "max_requests_per_min": 30,
         "attachments": {
             "enabled": true
         }

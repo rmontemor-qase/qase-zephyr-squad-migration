@@ -71,6 +71,18 @@ class ZephyrSquadApiClient:
         self._rate_lock = threading.Lock()
         self._next_slot = 0.0
 
+        # Retry visibility. A first-attempt retry used to log NOTHING, so a long
+        # stall left no trace and was indistinguishable from slow I/O. Every retry
+        # is now logged and counted; call retry_summary() at the end of a phase.
+        self._retry_lock = threading.Lock()
+        self.retry_stats = {
+            "non_json_200": 0,
+            "http_429": 0,
+            "http_5xx": 0,
+            "transport": 0,
+        }
+        self.retry_wait_sec = 0.0
+
     def _throttle(self):
         """Block until this request's paced slot (thread-safe, minimal lock hold)."""
         if self._min_interval <= 0:
@@ -82,6 +94,27 @@ class ZephyrSquadApiClient:
         wait = slot - time.monotonic()
         if wait > 0:
             time.sleep(wait)
+
+    def _note_retry(self, kind: str, wait: float) -> None:
+        """Count one retry and the time it cost (thread-safe)."""
+        with self._retry_lock:
+            self.retry_stats[kind] = self.retry_stats.get(kind, 0) + 1
+            self.retry_wait_sec += float(wait or 0.0)
+
+    def retry_summary(self) -> str:
+        """One-line cumulative retry report, or '' when nothing was retried.
+
+        Lets a phase state plainly whether it was slowed by ZAPI misbehaviour
+        rather than leaving the operator to infer it from wall-clock time.
+        """
+        with self._retry_lock:
+            stats = dict(self.retry_stats)
+            waited = self.retry_wait_sec
+        total = sum(stats.values())
+        if not total:
+            return ""
+        parts = ", ".join(f"{k}={v}" for k, v in stats.items() if v)
+        return f"{total} retry/retries ({parts}); ~{waited / 60.0:.1f} min spent backing off"
 
     # ------------------------------------------------------------------
     # JWT signing (Atlassian-Connect canonical request → qsh) — VERIFIED
@@ -170,9 +203,10 @@ class ZephyrSquadApiClient:
                                 f"{response.text[:200]!r}"
                             )
                         _wait = min(self.backoff_factor * (2 ** attempt), 30.0)
-                        if attempt >= 1 and self.logger:
-                            # Quiet on the first retry (usually enough); surface
-                            # persistent cases so a systemic problem is visible.
+                        self._note_retry("non_json_200", _wait)
+                        if self.logger:
+                            # Log EVERY attempt, first one included. Staying quiet
+                            # on attempt 0 hid a 20-minute stall on a real run.
                             self.logger.log(
                                 f"[ZAPI] non-JSON 200 on {path!r}; retrying in "
                                 f"{_wait:.0f}s (attempt {attempt + 1}/"
@@ -190,12 +224,16 @@ class ZephyrSquadApiClient:
                 # previously stalled the runs phase). Enough retries still outlast
                 # a rate-limit window without huge per-sleep overshoot.
                 _wait = min(self.backoff_factor * (2 ** attempt), 30.0)
-                if response.status_code == 429 and self.logger:
-                    # Surface rate-limiting (ZAPI ~1000 req/hr) — previously silent,
-                    # which hid the true cause of slow runs.
+                self._note_retry(
+                    "http_429" if response.status_code == 429 else "http_5xx", _wait
+                )
+                if self.logger:
+                    # Vendor-confirmed ceiling is 300 req/min, and it trips on
+                    # bursts rather than volume — so log every 429 AND every 5xx
+                    # retry, not just persistent ones.
                     self.logger.log(
-                        f"[ZAPI] 429 rate-limited on {path!r}; backing off {_wait:.0f}s "
-                        f"(attempt {attempt + 1}/{self.max_retries + 1})",
+                        f"[ZAPI] HTTP {response.status_code} on {path!r}; backing off "
+                        f"{_wait:.0f}s (attempt {attempt + 1}/{self.max_retries + 1})",
                         "warning",
                     )
                 time.sleep(_wait)
@@ -206,8 +244,17 @@ class ZephyrSquadApiClient:
                 http.client.RemoteDisconnected,
                 ConnectionResetError,
                 requests.exceptions.ConnectionError,
-            ):
-                time.sleep(min(self.backoff_factor * (2 ** attempt), 30.0))
+            ) as _exc:
+                _wait = min(self.backoff_factor * (2 ** attempt), 30.0)
+                self._note_retry("transport", _wait)
+                if self.logger:
+                    self.logger.log(
+                        f"[ZAPI] transport error on {path!r} "
+                        f"({type(_exc).__name__}); retrying in {_wait:.0f}s "
+                        f"(attempt {attempt + 1}/{self.max_retries + 1})",
+                        "warning",
+                    )
+                time.sleep(_wait)
             if attempt == self.max_retries:
                 raise APIError(f"Max retries reached for {path!r}")
 
