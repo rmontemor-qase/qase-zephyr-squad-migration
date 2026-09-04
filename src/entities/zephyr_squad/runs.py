@@ -1,4 +1,5 @@
 import asyncio
+import re
 
 from ...service.qase import QaseService
 from ...service.zephyr_squad import ZephyrSquadService
@@ -119,6 +120,253 @@ class Runs:
             raw = str(raw)
         return _strip_html(raw).strip()
 
+    async def _step_defs(self, code: str, issue_id, project_id) -> dict:
+        """``{stepId: {"order", "action", "data", "expected_result"}}`` for a test.
+
+        Cached per issue: a test's steps are the same across all its executions,
+        so this is one ZAPI call per TEST, not per execution.
+        """
+        cache = self._stepdef_cache
+        key = str(issue_id)
+        if key in cache:
+            return cache[key]
+        # The Cases phase already fetched these; reuse rather than re-fetch.
+        # A miss just costs the call it would have cost anyway.
+        raw = (self.mappings.step_defs.get(code) or {}).get(key)
+        if raw is None:
+            self._stepdef_misses[0] += 1
+            try:
+                raw = await self.pools.source(
+                    self.zephyr.get_test_steps, issue_id, project_id
+                ) or []
+            except Exception as e:
+                self.logger.log(
+                    f"[{code}][Runs] step definitions unavailable for issue "
+                    f"{issue_id}: {e}", "warning"
+                )
+                raw = []
+        else:
+            self._stepdef_hits[0] += 1
+        defs = {}
+        for st in raw:
+            if not isinstance(st, dict) or st.get("id") is None:
+                continue
+            defs[str(st["id"])] = {
+                "order": st.get("orderId") or 0,
+                "action": (_strip_html(str(st.get("step") or "")).strip() or "Step")[:1000],
+                "data": (_strip_html(str(st.get("data") or "")).strip() or None),
+                "expected_result": (_strip_html(str(st.get("result") or "")).strip() or None),
+            }
+        cache[key] = defs
+        return defs
+
+    async def _step_results(self, code: str, execution_id, issue_id, project_id) -> list:
+        """Per-step outcomes of one execution → ``custom_step_results``.
+
+        Shape is what ``QaseService.prepare_result_steps`` expects:
+        ``{"status_id", "actual", "position", "action", "data",
+        "expected_result"}``.
+
+        Two things make the join by ``stepId`` essential rather than cosmetic:
+
+        1. ``stepresult/search`` returns step results in ARBITRARY order
+           (observed ``[4, 7, 3, 2, 8, 1, 5, 6]`` on an 8-step test). Positioning
+           them by array index therefore pins each status and comment onto the
+           WRONG step — silently, and invisibly whenever every step shares a
+           status. Sorting by the definition's ``orderId`` is what makes the
+           result truthful.
+        2. A step result carries no step text at all, so without the definition
+           the run view has nothing to render but the comment.
+
+        Step status ids are the same set as execution statuses, so
+        ``mappings.result_statuses`` maps both. Never raises: a failure here
+        degrades the result to status-only rather than losing it.
+        """
+        try:
+            raw = await self.pools.source(
+                self.zephyr.get_step_results, execution_id, issue_id
+            ) or []
+        except Exception as e:
+            self.logger.log(
+                f"[{code}][Runs] step results unavailable for execution "
+                f"{execution_id}: {e}", "warning"
+            )
+            return []
+        if not raw:
+            return []
+        defs = await self._step_defs(code, issue_id, project_id)
+        rows = []
+        for sr in raw:
+            if not isinstance(sr, dict):
+                continue
+            d = defs.get(str(sr.get("stepId"))) or {}
+            status = sr.get("status") or {}
+            step_atts = []
+            if self._want_step_atts and sr.get("id"):
+                step_atts = await self._step_result_attachments(
+                    code, project_id, issue_id, sr["id"]
+                )
+            rows.append({
+                "_order": d.get("order") or 0,
+                "status_id": str(status.get("id")),
+                "actual": _strip_html(str(sr.get("comment") or "")).strip(),
+                "action": d.get("action"),
+                "data": d.get("data"),
+                "expected_result": d.get("expected_result"),
+                "attachments": step_atts or None,
+            })
+        if not defs:
+            # No definitions: keep ZAPI's order rather than inventing one, and
+            # say so — the positions cannot be trusted.
+            self.logger.log(
+                f"[{code}][Runs] no step definitions for issue {issue_id}; step "
+                f"order for execution {execution_id} may not match the case",
+                "warning",
+            )
+        else:
+            rows.sort(key=lambda r: r["_order"])
+        steps = []
+        for i, r in enumerate(rows, 1):
+            r.pop("_order", None)
+            r["position"] = i
+            steps.append({k: v for k, v in r.items() if v is not None})
+        return steps
+
+    async def _upload_attachments(self, code: str, found: list, project_id, issue_id,
+                                  what: str) -> list:
+        """Download Zephyr attachments and re-upload them to Qase → hashes.
+
+        Never raises: a failed file is reported and skipped so the surrounding
+        result still migrates.
+        """
+        hashes = []
+        for att in found or []:
+            aid, name = att.get("attachment_id"), att.get("filename") or "attachment"
+            if not aid:
+                continue
+            try:
+                raw = await self.pools.source(
+                    self.zephyr.download_attachment_bytes, aid, project_id, issue_id
+                )
+                if not raw:
+                    raise ValueError("empty download")
+                up = await self.pools.qs(self.qase.upload_attachment, code, (name, raw))
+                h = (up or {}).get("hash")
+                if not h:
+                    raise ValueError("no hash returned by Qase")
+                hashes.append(h)
+            except Exception as e:
+                # Record EVERYTHING a later recovery pass needs. The attachment
+                # object itself carries no issueId, and the download endpoint
+                # requires one, so without these ids a dropped file cannot be
+                # re-fetched without an expensive cycle-wide scan.
+                self.logger.log(
+                    f"[{code}][Runs] {what} attachment {name!r} NOT migrated: {e} "
+                    f"[recover: attachmentId={aid} issueId={issue_id} "
+                    f"projectId={project_id}]", "warning"
+                )
+                self.mappings.stats.add_issue(
+                    code, "run",
+                    f"{what}: attachment {name!r} was not migrated ({e}) "
+                    f"[attachmentId={aid} issueId={issue_id}]", "warning",
+                )
+        return hashes
+
+    async def _step_result_attachments(self, code: str, project_id, issue_id,
+                                       step_result_id) -> list:
+        """Files a tester attached to ONE step during execution → Qase hashes.
+
+        Costs one ZAPI call per STEP RESULT — the endpoint takes no batch (an
+        execution id is rejected, and multiple ids return only the first), so on
+        a large project this dominates the runs phase. Hence its own switch,
+        ``runs.step_result_attachments``.
+        """
+        try:
+            found = await self.pools.source(
+                self.zephyr.get_step_result_attachments, step_result_id
+            ) or []
+        except Exception as e:
+            self.logger.log(
+                f"[{code}][Runs] step-result attachment lookup failed for "
+                f"{step_result_id}: {e}", "warning"
+            )
+            return []
+        if not found:
+            return []
+        return await self._upload_attachments(
+            code, found, project_id, issue_id, f"step result {step_result_id}"
+        )
+
+    async def _execution_attachments(self, code: str, project_id, issue_id, execution_id) -> list:
+        """Zephyr execution attachments → Qase attachment hashes.
+
+        Downloads each file from ZAPI and re-uploads it to Qase. Both the
+        download and the search need projectId AND issueId. Never raises: a
+        failed file is reported and skipped, the result still migrates.
+        """
+        try:
+            found = await self.pools.source(
+                self.zephyr.get_execution_attachments, project_id, issue_id, execution_id
+            ) or []
+        except Exception as e:
+            self.logger.log(
+                f"[{code}][Runs] attachment lookup failed for execution "
+                f"{execution_id}: {e}", "warning"
+            )
+            return []
+        hashes = []
+        for att in found:
+            aid, name = att.get("attachment_id"), att.get("filename") or "attachment"
+            if not aid:
+                continue
+            try:
+                raw = await self.pools.source(
+                    self.zephyr.download_attachment_bytes, aid, project_id, issue_id
+                )
+                if not raw:
+                    raise ValueError("empty download")
+                up = await self.pools.qs(self.qase.upload_attachment, code, (name, raw))
+                h = (up or {}).get("hash")
+                if h:
+                    hashes.append(h)
+                else:
+                    raise ValueError("no hash returned by Qase")
+            except Exception as e:
+                self.logger.log(
+                    f"[{code}][Runs] attachment {name!r} NOT migrated: {e}", "warning"
+                )
+                self.mappings.stats.add_issue(
+                    code, "run",
+                    f"execution {execution_id}: attachment {name!r} was not migrated ({e})",
+                    "warning",
+                )
+        return hashes
+
+    _JIRA_KEY = re.compile(r"^[A-Z][A-Z0-9]*-\d+$")
+
+    @classmethod
+    def _exec_defects(cls, ex: dict) -> list:
+        """Jira defect keys linked to one execution.
+
+        Zephyr attaches defects in two places and this tenant uses the second:
+        ``defects`` on the execution itself, and ``stepDefects`` for defects
+        raised against an individual step. Both are read — a defect raised on a
+        step is still a defect for that run. Returns ``[(key, summary)]``.
+        """
+        out = []
+        for bucket in ("defects", "stepDefects"):
+            for d in (ex.get(bucket) or []):
+                if not isinstance(d, dict):
+                    continue
+                key = (d.get("key") or "").strip()
+                # Only PROJ-123 shaped keys. Zephyr also stores references that
+                # are not Jira keys (a bare numeric id was observed), which would
+                # render as a dead /browse/<id> link — skip rather than publish
+                # broken traceability.
+                if key and cls._JIRA_KEY.match(key):
+                    out.append((key, (d.get("summary") or "").strip()))
+        return out
+
     @staticmethod
     def _sec(ms) -> int:
         try:
@@ -146,6 +394,28 @@ class Runs:
         # created until the full fetch completes). Log every _log_every tests.
         done = 0
         _log_every = max(25, total_issues // 20)  # ~20 progress lines
+        # Each of these costs ONE extra ZAPI call per execution (attachments cost
+        # one more per file, plus a Qase upload), so both are switchable. On a
+        # project with thousands of executions that is the difference between a
+        # one-hour and a three-hour run.
+        _want_steps = bool(self.config.get("runs.step_results"))
+        _want_atts = bool(self.config.get("zephyr.attachments.enabled"))
+        # One ZAPI call per STEP RESULT — on a big project this is the single
+        # largest cost in the whole migration, so it is separately switchable.
+        self._want_step_atts = bool(_want_atts) and bool(
+            self.config.get("runs.step_result_attachments")
+        )
+        # [step results, execution attachments, defect links, step attachments]
+        nonlocal_steps = [0, 0, 0, 0]
+        # stepId -> definition, per issue (one ZAPI call per TEST, not per execution)
+        self._stepdef_cache = {}
+        self._stepdef_hits = [0]
+        self._stepdef_misses = [0]
+        self.logger.log(
+            f"[{code}][Runs] step results: {'ON' if _want_steps else 'OFF'} | "
+            f"execution attachments: {'ON' if _want_atts else 'OFF'} | "
+            f"step-result attachments: {'ON' if self._want_step_atts else 'OFF'}"
+        )
 
         async def fetch(issue_id):
             nonlocal done
@@ -176,8 +446,13 @@ class Runs:
                         continue
                     cyc = cycles.setdefault(
                         cid, {"name": ex.get("cycleName") or f"Cycle {cid}",
-                              "results": [], "ts": [], "version_id": None}
+                              "results": [], "ts": [], "version_id": None,
+                              "defects": {}}
                     )
+                    # Jira defects raised anywhere in this cycle, de-duplicated
+                    # by key (the same defect commonly spans several executions).
+                    for dkey, dsummary in self._exec_defects(ex):
+                        cyc["defects"].setdefault(dkey, dsummary)
                     # Jira fix version of this cycle -> Qase milestone (release
                     # traceability). -1 is Zephyr's "Unscheduled", i.e. no version.
                     if cyc.get("version_id") is None:
@@ -188,6 +463,22 @@ class Runs:
                     if sec:
                         cyc["ts"].append(sec)
                     status = ex.get("status") or {}
+                    exec_id = ex.get("id")
+                    step_results = []
+                    if _want_steps and exec_id:
+                        step_results = await self._step_results(
+                            code, exec_id, issue_id, project_id
+                        )
+                        nonlocal_steps[0] += len(step_results)
+                        nonlocal_steps[3] += sum(
+                            len(s.get("attachments") or []) for s in step_results
+                        )
+                    att_hashes = []
+                    if _want_atts and exec_id:
+                        att_hashes = await self._execution_attachments(
+                            code, project_id, issue_id, exec_id
+                        )
+                        nonlocal_steps[1] += len(att_hashes)
                     cyc["results"].append({
                         "test_id": str(ex.get("issueId")),
                         "status_id": str(status.get("id")),
@@ -195,7 +486,8 @@ class Runs:
                         "elapsed": 0,
                         "comment": self._exec_comment(ex),
                         "created_by": ex.get("executedByAccountId") or ex.get("executedBy"),
-                        "attachments": [],
+                        "attachments": att_hashes,
+                        "custom_step_results": step_results,
                     })
                 done += 1
                 if done % _log_every == 0 or done == total_issues:
@@ -210,6 +502,23 @@ class Runs:
             self.logger.log(f"[{code}][Runs] No executions found — nothing to migrate")
             return self.mappings
 
+        self.logger.log(
+            f"[{code}][Runs] {nonlocal_steps[0]} step result(s), "
+            f"{nonlocal_steps[1]} execution attachment(s) and "
+            f"{nonlocal_steps[3]} step-result attachment(s) collected"
+        )
+        self.logger.log(
+            f"[{code}][Runs] step definitions: {self._stepdef_hits[0]} reused from "
+            f"the Cases phase, {self._stepdef_misses[0]} re-fetched"
+        )
+        _cyc_with_defects = sum(1 for c in cycles.values() if c.get("defects"))
+        _all_defects = {k for c in cycles.values() for k in (c.get("defects") or {})}
+        self.logger.log(
+            f"[{code}][Runs] Jira defects: {len(_all_defects)} distinct across "
+            f"{_cyc_with_defects}/{len(cycles)} cycle(s)"
+            + ("" if self.mappings.jira_run_links_field_id
+               else "  — NO run 'Jira Links' field, these will NOT be written")
+        )
         self.logger.log(f"[{code}][Runs] {len(cycles)} cycle(s) with executions")
         self.mappings.stats.add_entity_count(code, "runs", "zephyr-squad", len(cycles))
 
@@ -264,6 +573,19 @@ class Runs:
                 "created_on": created_on, "completed_on": completed_on,
                 "author_id": self.mappings.default_user, "is_completed": True,
             }
+            # Jira defects for this cycle → run-level "Jira Links" custom field.
+            # Same shape as the case-level field: "KEY — url" per line.
+            fid = self.mappings.jira_run_links_field_id
+            defects = cyc.get("defects") or {}
+            if fid and defects:
+                base = (self.config.get("jira.base_url") or "").rstrip("/")
+                lines = []
+                for dkey in sorted(defects):
+                    summary = defects[dkey]
+                    label = f"{dkey} — {summary}" if summary else dkey
+                    lines.append(f"{label} — {base}/browse/{dkey}" if base else label)
+                run["custom_field"] = {str(fid): "\n".join(lines)}
+                nonlocal_steps[2] += len(defects)
             # Attach the run to the milestone for its cycle's Jira fix version.
             # None for Unscheduled cycles or when the version has no milestone.
             milestone_id = (self.mappings.version_to_milestone.get(code) or {}).get(

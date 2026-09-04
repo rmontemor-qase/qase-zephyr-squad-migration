@@ -50,6 +50,8 @@
         "priority_map": {},
         "jira_statuses": [],
         "preserve_ids": true,
+        "comments_custom_field": false,
+        "comments_limit": 0,
         "limit": 0,
         "batch_size": 50,
         "jira_custom_fields": {
@@ -58,7 +60,10 @@
     },
     "runs": {
         "status_map": {},
-        "concurrency": 6
+        "concurrency": 6,
+        "step_results": true,
+        "step_result_attachments": false,
+        "jira_links_custom_field": true
     },
     "migration": {
         "allow_existing_target": false,

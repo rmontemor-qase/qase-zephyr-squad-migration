@@ -172,11 +172,24 @@ class QaseService:
         return result
 
     def get_case_custom_fields(self):
-        self.logger.log('Getting custom fields from Qase')
+        return self.get_custom_fields_for('case')
+
+    def get_run_custom_fields(self):
+        return self.get_custom_fields_for('run')
+
+    def get_custom_fields_for(self, entity: str = 'case'):
+        """List Qase custom fields for one entity ('case', 'run' or 'defect').
+
+        The entity is part of a field's identity: a 'Jira Links' field created
+        for cases is NOT visible to runs and vice versa, so the lookup has to be
+        entity-scoped or a run field gets 'reused' from a case field id and the
+        value is silently dropped.
+        """
+        self.logger.log(f'Getting {entity} custom fields from Qase')
         try:
             def call():
                 api_instance = CustomFieldsApi(self.client)
-                api_response = api_instance.get_custom_fields(entity='case', limit=100)
+                api_response = api_instance.get_custom_fields(entity=entity, limit=100)
                 if api_response.status and api_response.result.entities:
                     return api_response.result.entities
                 return []
@@ -946,6 +959,13 @@ class QaseService:
         if len(cases) > 0:
             data['cases'] = cases
 
+        # Run-level custom fields ({field_id(str): value(str)}), e.g. the Jira
+        # defects raised against this cycle.
+        if run.get('custom_field'):
+            data['custom_field'] = {
+                str(k): str(v) for k, v in run['custom_field'].items() if v not in (None, '')
+            }
+
         try:
             # via _retry_io so a Qase 429 is waited out instead of silently
             # dropping the run (see _retry_io)
@@ -1166,6 +1186,17 @@ class QaseService:
                     if comment != '':
                         step_data['comment'] = comment
 
+                # Carry the step DEFINITION through when the caller supplies it.
+                # Without action/data/expected_result the run view has only the
+                # comment to render, and without an explicit position the result
+                # steps are numbered by array order — which is wrong whenever the
+                # source returns them unordered.
+                for field in ("position", "action", "data", "expected_result",
+                              "attachments"):
+                    value = step.get(field)
+                    if value not in (None, "", []):
+                        step_data[field] = value
+
                 data.append(step_data)
         except Exception as e:
             self.logger.log(f'Exception when preparing result steps: {e}', 'error')
@@ -1191,14 +1222,23 @@ class QaseService:
 
         return total_seconds
 
-    def upload_attachment(self, code, attachment_data):
-        """Upload to Qase. ``attachment_data`` is a filesystem path (str), or ``(filename, bytes)`` as in TestRail §3.1.
+    def upload_attachment(self, code, attachment_data, max_attempts: int = 5):
+        """Upload to Qase. ``attachment_data`` is a filesystem path (str), or ``(filename, bytes)``.
 
-        The qaseio client accepts path strings or ``io.BytesIO`` with ``.name`` and ``.mime`` set; tuple input is wrapped that way.
+        The qaseio client accepts path strings or ``io.BytesIO`` with ``.name`` and ``.mime`` set;
+        tuple input is wrapped that way.
+
+        RETRIES transient failures. This was the only Qase write path without a
+        retry (18 others go through ``_retry_io``), so a momentary
+        ``ConnectionResetError`` or timeout permanently lost the file — observed
+        live, silently reported by the caller as "no hash returned by Qase".
+
+        The payload is rebuilt on EVERY attempt: a ``BytesIO`` is consumed by the
+        first upload, so reusing it would send an empty file on the retry.
         """
         api_attachments = AttachmentsApi(self.client)
-        try:
-            file_payload = attachment_data
+
+        def build_payload():
             if isinstance(attachment_data, (tuple, list)) and len(attachment_data) == 2:
                 fname, raw = attachment_data[0], attachment_data[1]
                 if isinstance(raw, bytearray):
@@ -1208,15 +1248,33 @@ class QaseService:
                 buf = io.BytesIO(raw)
                 buf.name = os.path.basename(str(fname)) or "attachment"
                 buf.mime = mimetypes.guess_type(str(fname))[0] or "application/octet-stream"
-                file_payload = buf
-            elif isinstance(attachment_data, io.BytesIO):
-                file_payload = attachment_data
-            response = api_attachments.upload_attachment(code, file=[file_payload])
+                return buf
+            if isinstance(attachment_data, io.BytesIO):
+                attachment_data.seek(0)
+            return attachment_data
 
-            if response.status and response.result:
-                return response.result[0].to_dict()
-        except Exception as e:
-            self.logger.log(f'Exception when calling AttachmentsApi->upload_attachment: {e}')
+        name = attachment_data[0] if isinstance(attachment_data, (tuple, list)) else attachment_data
+        last = None
+        for attempt in range(max_attempts):
+            try:
+                response = api_attachments.upload_attachment(code, file=[build_payload()])
+                if response.status and response.result:
+                    return response.result[0].to_dict()
+                last = "response carried no result"
+            except Exception as e:
+                last = repr(e)
+            if attempt < max_attempts - 1:
+                wait = min(2 ** attempt, 15)
+                self.logger.log(
+                    f"Upload of {str(name)[:60]!r} failed ({last}); retrying in "
+                    f"{wait}s (attempt {attempt + 1}/{max_attempts})",
+                    "warning",
+                )
+                time.sleep(wait)
+        self.logger.log(
+            f"Upload of {str(name)[:60]!r} FAILED after {max_attempts} attempt(s): {last}",
+            "error",
+        )
         return None
 
     def attach_external_issues(self, code: str, links: list, issue_type: str = "jira-cloud") -> bool:

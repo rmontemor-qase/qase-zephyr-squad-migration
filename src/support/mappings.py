@@ -24,6 +24,21 @@ class Mappings:
         # "Jira Links" CF id — fallback home for Zephyr issue links when
         # native external-issue attach is unavailable (no Jira integration)
         self.jira_links_field_id = None
+        # Same idea for RUNS (custom-field entity 1): the Jira defects raised
+        # against a Zephyr cycle's executions. Qase has no native way to link a
+        # run to an external issue — /external-issue/attach exists for cases
+        # ONLY — so a run-scoped text field is the available mechanism.
+        self.jira_run_links_field_id = None
+        # "Comments" CF id — Jira issue comments mirrored onto the case.
+        # Qase has NO comments API (no route exists, verified live), so a text
+        # custom field is the only way to carry them across.
+        self.comments_field_id = None
+        # RAW Zephyr test steps, cached by the Cases phase and reused by Runs so
+        # the same ``teststep/{issueId}`` is not fetched twice per test:
+        #   {project_code: {issue_id(str): [raw step, ...]}}
+        # Raw (not processed) so each phase keeps its own formatting: Cases
+        # strips HTML and truncates, Runs needs orderId + text for step results.
+        self.step_defs = {}
 
         # "Labels": per-project MULTISELECT CF holding each test's Jira labels.
         # Replaces Qase tags entirely (tags capped at 10 and silently dropped

@@ -134,6 +134,12 @@ class Cases:
                     self.logger.log(
                         f"[{code}][Cases] steps fetch failed for {issue.get('key')}: {e}", "warning"
                     )
+                # Share with the Runs phase: it needs the same steps to order and
+                # label step results, and would otherwise re-fetch every test.
+                # Keyed by STRING id in both places — a type mismatch would only
+                # cause a cache miss (and a re-fetch), never a wrong-test hit.
+                if cache[iid]:
+                    self.mappings.step_defs.setdefault(code, {})[str(iid)] = cache[iid]
 
         async def fetch_att(issue):
             iid, ikey = issue.get("id"), issue.get("key")
@@ -412,6 +418,17 @@ class Cases:
                     str(o) for o in option_ids
                 )
 
+        # Jira issue comments → 'Comments' CF (cases.comments_custom_field).
+        # They arrive on the issue read we already make, so this costs no extra
+        # API call.
+        cmt_fid = self.mappings.comments_field_id
+        if cmt_fid:
+            text = self._format_comments(
+                fields, int(self.config.get("cases.comments_limit") or 0)
+            )
+            if text:
+                data.setdefault("custom_field", {})[str(cmt_fid)] = text[:10000]
+
         # Fixed values for the target's REQUIRED custom fields (Zephyr has no
         # equivalent data). Per project, since a field only exists in the projects
         # it is scoped to. setdefault: never override a value we actually migrated.
@@ -512,6 +529,36 @@ class Cases:
             if uid is not None:
                 return uid
         return self.mappings.default_user
+
+    @staticmethod
+    def _format_comments(fields: dict, limit: int = 0) -> str:
+        """Jira issue comments → plain text for the 'Comments' custom field.
+
+        Qase has no comments API, so this is the only route. Rendered oldest
+        first as ``[YYYY-MM-DD] Author: body`` so the thread reads in order.
+
+        ``limit`` (cases.comments_limit, 0 = all) keeps the newest N when a case
+        carries a long thread — a custom field is a single text blob, so an
+        unbounded thread makes the case hard to read.
+        """
+        block = fields.get("comment") or {}
+        raw = block.get("comments") if isinstance(block, dict) else None
+        if not isinstance(raw, list) or not raw:
+            return ""
+        if limit and len(raw) > limit:
+            raw = raw[-limit:]
+        lines = []
+        for cm in raw:
+            if not isinstance(cm, dict):
+                continue
+            body = _strip_html(str(cm.get("body") or "")).strip()
+            if not body:
+                continue
+            who = ((cm.get("author") or {}).get("displayName") or "").strip()
+            when = str(cm.get("created") or "")[:10]
+            head = " ".join(x for x in (f"[{when}]" if when else "", who) if x).strip()
+            lines.append(f"{head}: {body}" if head else body)
+        return "\n\n".join(lines)
 
     @staticmethod
     def _linked_issues(fields: dict) -> list:

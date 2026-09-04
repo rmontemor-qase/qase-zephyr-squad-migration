@@ -90,6 +90,10 @@ class Fields:
 
         # 3 — ensure the "Jira Reference" custom field exists on the target projects
         await self._ensure_jira_ref_field()
+        # 3b — same field, RUN entity, for defects raised against a cycle
+        await self._ensure_jira_run_field()
+        # 3c — Jira issue comments mirrored onto the case (no Qase comments API)
+        await self._ensure_comments_field()
 
         # 4 — SHARED component field ("Components"), feature-flagged
         await self._ensure_component_field()
@@ -513,6 +517,102 @@ class Fields:
             self.logger.log(f"[Fields] No Jira components — skipping '{title}' field", "warning")
             return
         self.mappings.component_field.update(await self._ensure_option_field(title, by_project))
+
+    async def _ensure_comments_field(self):
+        """Create (or reuse) a TEXT custom field 'Comments' on CASES.
+
+        Qase has no comments API — no such route exists (verified live: every
+        candidate path 404s, and the SDK ships no comments client) — so Jira
+        issue comments can only be carried across inside a custom field.
+        """
+        if not bool(self.config.get("cases.comments_custom_field")):
+            return
+        title = "Comments"
+        codes = sorted({p["code"] for p in self.mappings.projects if p.get("code")})
+        try:
+            existing = await self.pools.qs(self.qase.get_case_custom_fields) or []
+        except Exception as e:
+            self.logger.log(f"[Fields] Could not list Qase custom fields: {e}", "warning")
+            existing = []
+        for cf in existing:
+            if (getattr(cf, "title", "") or "").strip().lower() == title.lower():
+                cf_id = int(getattr(cf, "id"))
+                self.mappings.comments_field_id = cf_id
+                if not bool(getattr(cf, "is_enabled_for_all_projects", False)):
+                    have = [str(c) for c in (getattr(cf, "projects_codes", None) or [])]
+                    missing = [c for c in codes if c not in have]
+                    if missing:
+                        ok = await self.pools.qs(
+                            self.qase.update_custom_field, cf_id,
+                            {"title": title, "projects_codes": have + missing},
+                        )
+                        self.logger.log(
+                            f"[Fields] {'Scoped' if ok else 'FAILED to scope'} '{title}' CF "
+                            f"(id={cf_id}) to {missing}", "info" if ok else "warning",
+                        )
+                self.logger.log(f"[Fields] Reusing '{title}' CF (id={cf_id})")
+                return
+        cf_id = await self.pools.qs(self.qase.create_custom_field, {
+            "title": title, "entity": 0, "type": 2,  # 0=case, 2=text
+            "is_required": False, "is_visible": True, "is_filterable": True,
+            "is_enabled_for_all_projects": False, "projects_codes": codes,
+        })
+        if cf_id:
+            self.mappings.comments_field_id = cf_id
+            self.logger.log(f"[Fields] Created '{title}' CF (id={cf_id})")
+        else:
+            self.logger.log(f"[Fields] Could not create '{title}' CF", "error")
+
+    async def _ensure_jira_run_field(self):
+        """Create (or reuse) a TEXT custom field 'Jira Links' scoped to RUNS.
+
+        Holds the Jira defects raised against a Zephyr cycle's executions. Qase
+        exposes ``/external-issue/attach`` for CASES only, so there is no native
+        way to link a run to a Jira issue; a run-entity custom field is the
+        mechanism available.
+
+        The lookup MUST be run-entity: a field's entity is part of its identity,
+        so the case 'Jira Links' field is invisible here and reusing its id would
+        make Qase silently drop the value.
+        """
+        if not bool(self.config.get("runs.jira_links_custom_field", True)):
+            self.logger.log("[Fields] runs.jira_links_custom_field OFF — skipping run 'Jira Links' CF")
+            return
+        title = "Jira Links"
+        codes = sorted({p["code"] for p in self.mappings.projects if p.get("code")})
+        try:
+            existing = await self.pools.qs(self.qase.get_run_custom_fields) or []
+        except Exception as e:
+            self.logger.log(f"[Fields] Could not list Qase RUN custom fields: {e}", "warning")
+            existing = []
+        for cf in existing:
+            if (getattr(cf, "title", "") or "").strip().lower() == title.lower():
+                cf_id = int(getattr(cf, "id"))
+                self.mappings.jira_run_links_field_id = cf_id
+                if not bool(getattr(cf, "is_enabled_for_all_projects", False)):
+                    have = [str(c) for c in (getattr(cf, "projects_codes", None) or [])]
+                    missing = [c for c in codes if c not in have]
+                    if missing:
+                        ok = await self.pools.qs(
+                            self.qase.update_custom_field, cf_id,
+                            {"title": title, "projects_codes": have + missing},
+                        )
+                        self.logger.log(
+                            f"[Fields] {'Scoped' if ok else 'FAILED to scope'} run '{title}' CF "
+                            f"(id={cf_id}) to {missing}", "info" if ok else "warning",
+                        )
+                self.logger.log(f"[Fields] Reusing run '{title}' CF (id={cf_id})")
+                return
+        cf_id = await self.pools.qs(self.qase.create_custom_field, {
+            "title": title, "entity": 1, "type": 2,  # 1=run, 2=text
+            "is_required": False, "is_visible": True, "is_filterable": True,
+            "is_enabled_for_all_projects": False, "projects_codes": codes,
+        })
+        if cf_id:
+            self.mappings.jira_run_links_field_id = cf_id
+            self.logger.log(f"[Fields] Created run '{title}' CF (id={cf_id})")
+        else:
+            self.logger.log(f"[Fields] Could not create run '{title}' CF", "error")
 
     async def _ensure_jira_ref_field(self):
         """Create (or reuse) a text custom field 'Jira Links' scoped to the target

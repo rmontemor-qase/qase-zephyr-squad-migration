@@ -155,10 +155,19 @@ class ZephyrSquadApiClient:
         return token.decode("utf-8") if isinstance(token, bytes) else token
 
     def _headers(self, method: str, relative_path: str, params: dict) -> dict:
+        """Auth headers for a GET. Deliberately WITHOUT ``Content-Type``.
+
+        Sending ``Content-Type: application/json`` on a GET makes ZAPI reject
+        several endpoints with HTTP 400 ``{"clientMessage": "Invalid Json"}``
+        even though a GET carries no body. Verified by A/B against a live
+        tenant: ``cycles/search`` and ``stepresult/search`` both return 400
+        with the header and 200 without it, while every other endpoint returns
+        a byte-identical response either way. The header made two working
+        endpoints look permanently broken.
+        """
         return {
             "zapiAccessKey": self.access_key,
             "Authorization": f"JWT {self._generate_jwt(method, relative_path, params)}",
-            "Content-Type": "application/json",
         }
 
     # ------------------------------------------------------------------
@@ -396,8 +405,18 @@ class ZephyrSquadApiClient:
     # Step results  (GET /stepresult/search?executionId=)
     # ------------------------------------------------------------------
 
-    def get_step_results(self, execution_id) -> list:
-        data = self._get_optional("stepresult/search", {"executionId": execution_id})
+    def get_step_results(self, execution_id, issue_id=None) -> list:
+        """Per-step outcomes of one execution (status, comment, executor, defects).
+
+        ``issueId`` is REQUIRED by the endpoint — without it ZAPI answers
+        ``Missing parameter: issueId``. Together with the omitted Content-Type
+        header (see :meth:`_headers`) this is what makes step-level results
+        retrievable at all.
+        """
+        params = {"executionId": execution_id}
+        if issue_id is not None:
+            params["issueId"] = issue_id
+        data = self._get_optional("stepresult/search", params)
         return self._as_list(data, "stepResults", "searchObjectList", "values")
 
     # ------------------------------------------------------------------
@@ -413,25 +432,94 @@ class ZephyrSquadApiClient:
     def get_stepresult_attachments(self, project_id, issue_id, entity_id) -> list:
         return self._attachments("stepresult", project_id, issue_id, entity_id)
 
+    def get_step_result_attachments(self, step_result_id) -> list:
+        """Files a tester attached to ONE step during execution.
+
+        ``GET /attachments?stepResultId=<id>`` → ``{"stepResultAttachment": [...]}``.
+
+        This is a DIFFERENT endpoint from ``attachment/search/{kind}``, which
+        only serves ``execution`` and ``teststep`` entities — there is no
+        ``stepresult`` kind there, which is why these files look unreachable if
+        you only probe that path. Verified live against a case whose Zephyr UI
+        shows step attachments.
+
+        Strictly ONE id per request: ``executionId`` is rejected, a
+        comma-separated list returns empty, and a repeated parameter returns
+        only the first id's files. So this costs one call per step result and
+        cannot be batched.
+        """
+        if not step_result_id:
+            return []
+        data = self._get_optional("attachments", {"stepResultId": step_result_id})
+        return self._normalise_attachments(
+            self._as_list(data, "stepResultAttachment", "attachments", "data")
+        )
+
+    def get_test_step_attachments(self, test_step_id) -> list:
+        """Files attached to a test STEP definition (same endpoint, other entity)."""
+        if not test_step_id:
+            return []
+        data = self._get_optional("attachments", {"testStepId": test_step_id})
+        return self._normalise_attachments(
+            self._as_list(data, "testStepAttachment", "attachments", "data")
+        )
+
+    @staticmethod
+    def _normalise_attachments(raw_list: list) -> list:
+        """``[{filename, attachment_id, raw}]``. Filename key is ``name``."""
+        out = []
+        for a in raw_list or []:
+            if not isinstance(a, dict):
+                continue
+            aid = a.get("id") or a.get("attachmentId") or a.get("fileId")
+            name = a.get("name") or a.get("fileName") or a.get("filename") or "attachment"
+            out.append({"filename": name, "attachment_id": aid, "raw": a})
+        return out
+
     def _attachments(self, kind: str, project_id, issue_id, entity_id) -> list:
         """``GET /attachment/search/{kind}`` → normalised
-        ``[{"filename", "attachment_id", "raw"}]``."""
+        ``[{"filename", "attachment_id", "raw"}]``.
+
+        ZAPI answers with a MAP keyed by entity id — ``{entityId: [att, ...]}``
+        — not a ``{"data": [...]}`` envelope, and each attachment's filename is
+        under ``name`` (``fileName`` is never present). Both assumptions were
+        wrong before, so this returned ``[]`` for every execution and silently
+        dropped every execution attachment. Only ``execution`` and ``teststep``
+        are valid ``kind`` values; there is no step-result route on ZAPI 1.0.
+        """
         data = self._get_optional(
             f"attachment/search/{kind}",
             {"projectId": project_id, "issueId": issue_id, "entityId": entity_id},
         )
-        raw_list = self._as_list(data, "data", "attachments", "values")
+        raw_list = []
+        if isinstance(data, dict):
+            for value in data.values():
+                if isinstance(value, list):
+                    raw_list.extend(value)
+            if not raw_list:
+                raw_list = self._as_list(data, "data", "attachments", "values")
+        elif isinstance(data, list):
+            raw_list = data
         out = []
         for a in raw_list:
             if not isinstance(a, dict):
                 continue
             aid = a.get("id") or a.get("attachmentId") or a.get("fileId")
-            name = a.get("fileName") or a.get("name") or a.get("filename") or "attachment"
+            name = a.get("name") or a.get("fileName") or a.get("filename") or "attachment"
             out.append({"filename": name, "attachment_id": aid, "raw": a})
         return out
 
     def download_attachment_bytes(self, attachment_id, project_id=None, issue_id=None) -> bytes:
-        """Download an attachment binary (GET /attachment/{id}, JWT-signed)."""
+        """Download an attachment binary (GET /attachment/{id}, JWT-signed).
+
+        BOTH ``projectId`` and ``issueId`` are required; without them ZAPI
+        answers ``Missing parameter``.
+
+        Retries like :meth:`_get`. Previously this was a single attempt with a
+        bare ``except: pass``, so ANY 429 or transient error silently lost the
+        file and surfaced only as "empty download" — under sustained load that
+        drops a large share of a project's attachments with no way to tell which.
+        """
         if not attachment_id:
             return None
         params = {}
@@ -441,17 +529,55 @@ class ZephyrSquadApiClient:
             params["issueId"] = issue_id
         relative_path = f"/public/rest/api/1.0/attachment/{attachment_id}"
         url = f"{self.base_url}{relative_path}"
-        try:
-            self._throttle()
-            resp = requests.get(
-                url,
-                headers=self._headers("GET", relative_path, params),
-                params=params,
-                timeout=(30.0, 120.0),
-                allow_redirects=True,
+        for attempt in range(self.max_retries + 1):
+            try:
+                self._throttle()
+                resp = requests.get(
+                    url,
+                    headers=self._headers("GET", relative_path, params),
+                    params=params,
+                    timeout=(30.0, 120.0),
+                    allow_redirects=True,
+                )
+                if resp.status_code == 200 and resp.content:
+                    return resp.content
+                # Deterministic 4xx (not 408/429) will never succeed — stop.
+                if 400 <= resp.status_code < 500 and resp.status_code not in (408, 429):
+                    if self.logger:
+                        self.logger.log(
+                            f"[ZAPI] attachment {attachment_id} download failed: "
+                            f"HTTP {resp.status_code} (non-retryable)", "warning",
+                        )
+                    return None
+                _wait = min(self.backoff_factor * (2 ** attempt), 30.0)
+                self._note_retry(
+                    "http_429" if resp.status_code == 429 else "http_5xx", _wait
+                )
+                if self.logger:
+                    self.logger.log(
+                        f"[ZAPI] attachment {attachment_id} download HTTP "
+                        f"{resp.status_code}; retrying in {_wait:.0f}s "
+                        f"(attempt {attempt + 1}/{self.max_retries + 1})", "warning",
+                    )
+            except (
+                requests.exceptions.Timeout,
+                http.client.RemoteDisconnected,
+                ConnectionResetError,
+                requests.exceptions.ConnectionError,
+            ) as exc:
+                _wait = min(self.backoff_factor * (2 ** attempt), 30.0)
+                self._note_retry("transport", _wait)
+                if self.logger:
+                    self.logger.log(
+                        f"[ZAPI] attachment {attachment_id} download "
+                        f"{type(exc).__name__}; retrying in {_wait:.0f}s "
+                        f"(attempt {attempt + 1}/{self.max_retries + 1})", "warning",
+                    )
+            if attempt < self.max_retries:
+                time.sleep(min(self.backoff_factor * (2 ** attempt), 30.0))
+        if self.logger:
+            self.logger.log(
+                f"[ZAPI] attachment {attachment_id} download gave up after "
+                f"{self.max_retries + 1} attempt(s)", "warning",
             )
-            if resp.status_code == 200 and resp.content:
-                return resp.content
-        except Exception:
-            pass
         return None

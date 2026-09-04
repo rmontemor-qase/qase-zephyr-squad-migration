@@ -109,12 +109,10 @@ class ZephyrSquadService:
     def get_test_steps(self, issue_id, project_id=None) -> list:
         return self.client.get_test_steps(issue_id, project_id)
 
-    def get_step_results(self, execution_id) -> list:
-        return self.client.get_step_results(execution_id)
-
-    # ------------------------------------------------------------------
-    # Statuses  (ZAPI)
-    # ------------------------------------------------------------------
+    def get_step_results(self, execution_id, issue_id=None) -> list:
+        """Per-step outcomes of an execution. ``issue_id`` is required by ZAPI —
+        omitting it returns ``Missing parameter: issueId``."""
+        return self.client.get_step_results(execution_id, issue_id)
 
     def get_execution_statuses(self) -> list:
         return self.client.get_execution_statuses()
@@ -125,6 +123,14 @@ class ZephyrSquadService:
     # ------------------------------------------------------------------
     # Attachments  (ZAPI, sanctioned GET read endpoints) — deferred phase
     # ------------------------------------------------------------------
+
+    def get_step_result_attachments(self, step_result_id) -> list:
+        """Files attached to ONE step during execution (one call per step result)."""
+        return self.client.get_step_result_attachments(step_result_id)
+
+    def get_test_step_attachments(self, test_step_id) -> list:
+        """Files attached to a test STEP definition."""
+        return self.client.get_test_step_attachments(test_step_id)
 
     def get_execution_attachments(self, project_id, issue_id, entity_id) -> list:
         return self.client.get_execution_attachments(project_id, issue_id, entity_id)
@@ -155,6 +161,11 @@ class ZephyrSquadService:
         # case builder would never see them (the default projection omits them).
         extra = [str(k).strip() for k in (self.config.get("cases.jira_custom_fields") or {})
                  if str(k).strip()]
+        # cases.comments_custom_field: comments ride along on this same issue read,
+        # so mirroring them costs NO extra API calls — but the default projection
+        # omits them, so they have to be asked for explicitly.
+        if bool(self.config.get("cases.comments_custom_field")):
+            extra.append("comment")
         fields = None
         if extra:
             fields = list(self.jira._TEST_ISSUE_FIELDS) + extra
