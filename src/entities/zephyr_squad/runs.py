@@ -332,8 +332,16 @@ class Runs:
                 else:
                     raise ValueError("no hash returned by Qase")
             except Exception as e:
+                # Record the SAME recovery context the step-level path logs
+                # (see _upload_attachments). Without it an execution-level loss
+                # leaves only a filename, and the download endpoint REQUIRES
+                # issueId — so the file cannot be re-fetched afterwards without
+                # scanning the whole project for whichever execution owns it.
+                # That gap cost real time on two separate migrations.
                 self.logger.log(
-                    f"[{code}][Runs] attachment {name!r} NOT migrated: {e}", "warning"
+                    f"[{code}][Runs] attachment {name!r} NOT migrated: {e} "
+                    f"[recover: attachmentId={aid} issueId={issue_id} "
+                    f"projectId={project_id} executionId={execution_id}]", "warning"
                 )
                 self.mappings.stats.add_issue(
                     code, "run",
@@ -591,10 +599,21 @@ class Runs:
             milestone_id = (self.mappings.version_to_milestone.get(code) or {}).get(
                 cyc.get("version_id")
             )
+            # Qase computes a run's verdict from the cases PLANNED in it. Created
+            # with an empty case list the run has nothing to judge against, so it
+            # reports "passed" no matter what its results say — and adding results
+            # afterwards never re-computes it. That is why, on one migrated project,
+            # all 243 runs showed passed while 173 of them held failed results. Pass the cycle's case
+            # ids up front so the verdict is real.
+            run_case_ids = sorted({
+                cases_map[r["test_id"]]
+                for r in (cyc.get("results") or [])
+                if isinstance(r, dict) and r.get("test_id") in cases_map
+            })
             async with run_sem:
                 try:
                     qase_run_id = await self.pools.qs(
-                        self.qase.create_run, run, code, [], milestone_id
+                        self.qase.create_run, run, code, run_case_ids, milestone_id
                     )
                 except Exception as e:
                     self.logger.log(f"[{code}][Runs] create_run failed for {title!r}: {e}", "error")
