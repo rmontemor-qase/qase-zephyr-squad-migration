@@ -7,7 +7,7 @@ import urllib.parse
 import jwt
 import requests
 
-from ..exceptions.api import APIError
+from ..exceptions.api import APIError, RetriesExhausted
 
 _DEFAULT_BASE_URL = "https://prod-api.zephyr4jiracloud.com/connect"
 _JWT_EXPIRE_SEC = 3600  # ZAPI recommends short-lived, per-request tokens
@@ -265,12 +265,24 @@ class ZephyrSquadApiClient:
                     )
                 time.sleep(_wait)
             if attempt == self.max_retries:
-                raise APIError(f"Max retries reached for {path!r}")
+                raise RetriesExhausted(f"Max retries reached for {path!r}")
 
     def _get_optional(self, path: str, params: dict = None, version: str = "1.0"):
-        """Like :meth:`_get` but returns ``None`` on any 4xx instead of raising."""
+        """Like :meth:`_get` but returns ``None`` when the resource is genuinely absent.
+
+        Exhausting the retry ladder is NOT absence and is deliberately re-raised.
+        Swallowing it returned ``None`` → ``_as_list`` → ``[]``, so the caller
+        recorded "this execution has no step results" when the truth was "we never
+        managed to ask". That is silent data loss: no log line, no counter, and
+        indistinguishable afterwards from a genuinely stepless execution. It cost
+        14 executions their step results on one migrated project. Callers already wrap these in
+        try/except and log with the ids needed to recover, so raising makes the
+        failure visible instead of inventing an empty answer.
+        """
         try:
             return self._get(path, params, version)
+        except RetriesExhausted:
+            raise
         except APIError:
             return None
 
