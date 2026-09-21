@@ -205,10 +205,19 @@ class JiraLookupClient:
     def get_user(self, account_id) -> dict:
         """Look up a Jira user by Atlassian account id (READ-ONLY).
 
-        Returns ``{"accountId", "emailAddress", "displayName"}`` — ``emailAddress``
-        is often ``None`` on Jira Cloud (profile-privacy), so callers must be able
-        to fall back to ``displayName``. Used to retain authorship by matching
-        source users onto users that already exist in Qase. ``{}`` on failure.
+        Returns ``{"accountId", "emailAddress", "displayName", "active",
+        "accountType"}`` — ``emailAddress`` is often ``None`` on Jira Cloud
+        (profile-privacy), so callers must be able to fall back to
+        ``displayName``. Used to retain authorship by matching source users onto
+        users that already exist in Qase. ``{}`` on failure.
+
+        ``active`` and ``accountType`` are what make provisioning selective:
+        Jira returns both and we used to discard them, leaving no way to tell a
+        current tester from a deactivated leaver, or a person from an
+        integration. ``accountType`` is ``atlassian`` for people, ``app`` for
+        bots (this workspace already has a "Jira Cloud" app account sitting in
+        its user list) and ``customer`` for JSM portal users. Every Qase user
+        costs a licence, so both flags matter before anyone is created.
         """
         if not account_id:
             return {}
@@ -222,6 +231,10 @@ class JiraLookupClient:
             "accountId": data.get("accountId") or str(account_id),
             "emailAddress": data.get("emailAddress"),
             "displayName": data.get("displayName"),
+            # None (not False) when Jira omits it, so "unknown" stays
+            # distinguishable from "known to be deactivated".
+            "active": data.get("active"),
+            "accountType": data.get("accountType"),
         }
 
     def get_issue_attachments(self, issue_id_or_key) -> list:
