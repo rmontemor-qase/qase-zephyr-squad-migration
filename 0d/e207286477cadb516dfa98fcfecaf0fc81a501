@@ -1,0 +1,24 @@
+src/api/jira_lookup.py
+  s_452c21d38c3f71::t_250eda38aed8a0 208-220,234-237
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0de207286477cadb516dfa98fcfecaf0fc81a501",
+  "prompts": {},
+  "humans": {
+    "h_cfb642ecaccda9": {
+      "author": "rmontemor-qase <rmontemor@qase.io>"
+    }
+  },
+  "sessions": {
+    "s_452c21d38c3f71": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d75b834b-378c-43fd-92e0-ed051183e4b1",
+        "model": "claude-opus-5"
+      },
+      "human_author": "rmontemor-qase <rmontemor@qase.io>"
+    }
+  }
+}
