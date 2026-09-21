@@ -1,11 +1,24 @@
 # Never commit credentials or run artifacts — this repo may be public.
+# Match EVERY config variant, not just config.json: keeping one file per
+# environment (config.sandbox.json / config.prod.json) is what stops a switch
+# between tenants from overwriting the other environment's credentials, and
+# those extra files must be ignored too or the fix becomes a leak.
 config.json
+config.*.json
+!config.example.json
 logs/
 stats/
 cache/
 
 # Read-only preflight output — contains sampled CUSTOMER data (Zephyr/Jira responses).
 preflight_shapes.json
+
+# Write-ahead spool: fetched CUSTOMER results held on disk only until Qase
+# confirms the write, then deleted. Must never be committed — it is raw customer
+# execution data (statuses, comments, attachment hashes).
+spool/
+.spool/
+*.spool.jsonl
 
 # Captured browser session for attachment downloads — a full session credential.
 zephyr_session.json
