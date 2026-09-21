@@ -1,0 +1,29 @@
+src/exceptions/api.py
+  s_452c21d38c3f71::t_0b32b03118c891 12-13
+  s_452c21d38c3f71::t_014ca258923fbc 3-11,14
+src/api/zephyr_squad.py
+  s_452c21d38c3f71::t_7e8d7662f869ed 271-277,279-281,284-285
+  s_452c21d38c3f71::t_0b32b03118c891 278
+  s_452c21d38c3f71::t_d923b173ea598a 10,268
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e7bac7e4d231892cd242c98e6b66324812541497",
+  "prompts": {},
+  "humans": {
+    "h_cfb642ecaccda9": {
+      "author": "rmontemor-qase <rmontemor@qase.io>"
+    }
+  },
+  "sessions": {
+    "s_452c21d38c3f71": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d75b834b-378c-43fd-92e0-ed051183e4b1",
+        "model": "claude-opus-5"
+      },
+      "human_author": "rmontemor-qase <rmontemor@qase.io>"
+    }
+  }
+}
