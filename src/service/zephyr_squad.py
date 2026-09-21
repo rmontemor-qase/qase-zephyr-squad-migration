@@ -20,6 +20,38 @@ class ZephyrSquadService:
     still constructs so read-only preflight can report the gap clearly.
     """
 
+    @staticmethod
+    def _build_cache(config: ConfigManager, logger: Logger):
+        """Return a SourceCache, or None when the cache is off or unsafe.
+
+        Off by default and on purpose: a cache that defaults to on will
+        eventually serve stale source data to someone who never chose it.
+        """
+        if not bool(config.get("cache.enabled")):
+            logger.log("[Cache] source response cache is OFF (cache.enabled=false)")
+            return None
+        # Imported only on the enabled path so a disabled run pays nothing,
+        # sqlite3 included.
+        from ..support.source_cache import SourceCache
+
+        path = SourceCache.resolve_path(config.get("cache.dir") or "./cache", logger)
+        if not path:
+            return None
+        cache = SourceCache(path, logger, verbose=bool(config.get("debug")))
+        rows = cache.row_count()
+        logger.log(
+            f"[Cache] source response cache ENABLED: {path} ({rows} row(s) already "
+            f"stored). It holds RAW CUSTOMER API RESPONSES, is never committed, and "
+            f"serves STALE source data until cleared with --clear-cache."
+        )
+        # Reported at exit rather than from the importer, so the migration flow
+        # itself is untouched. Ctrl+C still runs atexit, which is exactly the
+        # case this cache exists for.
+        import atexit
+
+        atexit.register(lambda: logger.log(cache.summary()))
+        return cache
+
     def __init__(self, config: ConfigManager, logger: Logger):
         self.config = config
         self.logger = logger
@@ -30,6 +62,12 @@ class ZephyrSquadService:
         base_url = str(config.get("zephyr.base_url") or _DEFAULT_BASE_URL).strip()
         page_size = int(config.get("zephyr.page_size") or 100)
 
+        # Opt-in source response cache. Built BEFORE the clients so both share
+        # one database. Disabled is a true no-op: nothing imported, no directory
+        # created, no file touched (src/support/source_cache.py explains why it
+        # must never be committed and when to clear it).
+        self.cache = self._build_cache(config, logger)
+
         self.client = ZephyrSquadApiClient(
             account_id=account_id,
             access_key=access_key,
@@ -38,6 +76,7 @@ class ZephyrSquadService:
             base_url=base_url,
             page_size=page_size,
             max_requests_per_min=float(config.get("zephyr.max_requests_per_min") or 30),
+            cache=self.cache,
         )
 
         jira_base = str(config.get("jira.base_url") or "").strip()
@@ -45,7 +84,9 @@ class ZephyrSquadService:
         jira_token = str(config.get("jira.api_token") or "").strip()
         self.jira = None
         if jira_base and jira_email and jira_token:
-            self.jira = JiraLookupClient(jira_base, jira_email, jira_token, logger)
+            self.jira = JiraLookupClient(
+                jira_base, jira_email, jira_token, logger, cache=self.cache
+            )
             self.logger.log("[ZephyrSquad] Jira read client ENABLED")
         else:
             self.logger.log(

@@ -89,6 +89,8 @@ Both sides are required — see [CREDENTIALS.md](CREDENTIALS.md) for a field-by-
 python preflight.py          # read-only: validates config, JWT auth, and samples shapes
 python start.py --dry-run    # full read-only rehearsal: reads everything, writes NOTHING to Qase
 python start.py              # the real migration
+python start.py --clear-cache  # wipe the source cache first (see Source response cache)
+python start.py --no-cache     # ignore cache.enabled for this one run
 ```
 
 `--dry-run` runs the whole pipeline against the source, so unmapped statuses,
@@ -97,7 +99,7 @@ every Qase write is logged as `[DRY-RUN] would …`.
 
 Logs land in `logs/`, stats in `stats/` (JSON + XLSX). Each run ends with a
 **migration report** listing every skipped or degraded item and why.
-`config.json`, `logs/`, and `stats/` are gitignored — never commit them.
+`config.json`, `logs/`, `stats/`, and `cache/` are gitignored — never commit them.
 
 ## Config reference
 
@@ -159,6 +161,45 @@ Logs land in `logs/`, stats in `stats/` (JSON + XLSX). Each run ends with a
 | `migration.allow_existing_target` | Import into a non-empty Qase project (duplicates likely) | `false` |
 | `migration.qase_bulk_hydrate_case_ids` | Look up each case's real id after bulk create. Only needed when `preserve_ids` is off; matches by title, so duplicate titles are ambiguous | `false` |
 | `prefix` / `debug` | Output filename prefix / verbose logging | `zephyr-squad` / `false` |
+
+### Source response cache
+
+| Key | Meaning | Default |
+|---|---|---|
+| `cache.enabled` | Cache successful Zephyr and Jira GET responses to disk so an interrupted run resumes instead of re-fetching. **Off by default** — see below before turning it on | `false` |
+| `cache.dir` | Where the cache lives. Constrained to `cache/`; anything resolving outside it is refused and the cache is disabled for that run | `./cache` |
+
+## Source response cache
+
+Qase's write API is fast. The painful side is reading: ZAPI Cloud paces at
+roughly 1000 requests/hour, and classic Squad forces a per-issue sweep, so a
+large project costs hours of GETs. Without a cache, a run killed at 90% by a
+dropped connection or a rate-limit wall starts those hours again from zero.
+With `cache.enabled: true`, a re-run replays what it already fetched from disk
+and reaches the same point in minutes.
+
+Read this before enabling it:
+
+- **It is off by default, on purpose.** A cache that defaults to on will
+  eventually serve someone stale source data without them choosing that. It is
+  opted into per engagement, per run.
+- **It holds raw customer API responses** — test case content, issue keys,
+  account ids, email addresses, internal URLs. It is customer data at rest on
+  whatever machine runs the migration.
+- **It is never committed.** It lives only under `cache/`, which is gitignored,
+  and `*.db` / `*.sqlite*` are ignored as well. This repo is public, and a
+  committed cache is a customer data disclosure that `git rm` does not undo:
+  the blob stays readable by hash forever.
+- **It serves stale source data until cleared.** Clear it with `--clear-cache`
+  between engagements *and* between re-migrations of the same project.
+  Otherwise a re-run faithfully reproduces last week's Zephyr, which defeats
+  the point of re-running.
+- **Delete it when an engagement closes.**
+
+Only successful GETs are cached. A 4xx, a 429, a 5xx and a non-JSON 200 all
+raise or retry rather than returning, so none of them can reach the cache, and
+attachment downloads never pass through the cached path at all. Nothing is
+written to the source, because the migration never writes to the source.
 
 ## Attachments
 

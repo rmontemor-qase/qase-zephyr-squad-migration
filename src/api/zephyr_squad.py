@@ -13,6 +13,12 @@ _DEFAULT_BASE_URL = "https://prod-api.zephyr4jiracloud.com/connect"
 _JWT_EXPIRE_SEC = 3600  # ZAPI recommends short-lived, per-request tokens
 
 
+# Cache-miss sentinel, owned here so this module never imports the cache
+# (and therefore never imports sqlite3) on a run with the cache disabled.
+# Identity, not truthiness: a cached [], {}, 0 or None is a real hit.
+_CACHE_MISS = object()
+
+
 class ZephyrSquadApiClient:
     """READ-ONLY client for the Zephyr Squad Cloud REST API (ZAPI Cloud v1.0/2.0).
 
@@ -49,6 +55,7 @@ class ZephyrSquadApiClient:
         read_timeout: float = 60.0,
         page_size: int = 100,
         max_requests_per_min: float = 30.0,
+        cache=None,
     ):
         if not (account_id and access_key and secret_key):
             raise APIError(
@@ -64,6 +71,9 @@ class ZephyrSquadApiClient:
         self.backoff_factor = backoff_factor
         self.request_timeout = (float(connect_timeout), float(read_timeout))
         self.page_size = int(page_size)
+        # Opt-in read-through response cache (src/support/source_cache.py).
+        # None = off, and off is the default: nothing below changes shape.
+        self._cache = cache
         # Global request pacer — ZAPI Cloud enforces a strict rate limit (~1000/hr).
         # Spacing request STARTS at a steady interval avoids the 429 thundering-herd
         # (many concurrent requests all rejected + backing off) that made runs crawl.
@@ -183,6 +193,13 @@ class ZephyrSquadApiClient:
         params = params or {}
         relative_path = f"/public/rest/api/{version}/{path.lstrip('/')}"
         url = f"{self.base_url}{relative_path}"
+        # Keyed on path + params + version, never on `url` or the headers: the
+        # JWT is re-signed per request, so either would change every call and
+        # produce a silent 100% miss rate.
+        if self._cache is not None:
+            _cached = self._cache.get("zapi", path, params, version, _CACHE_MISS)
+            if _cached is not _CACHE_MISS:
+                return _cached
         for attempt in range(self.max_retries + 1):
             try:
                 self._throttle()
@@ -194,7 +211,7 @@ class ZephyrSquadApiClient:
                 )
                 if response.status_code == 200:
                     try:
-                        return response.json()
+                        _payload = response.json()
                     except (ValueError, requests.exceptions.JSONDecodeError):
                         # ZAPI intermittently answers a 200 with a NON-JSON body
                         # under sustained concurrent load (observed heavily on
@@ -224,6 +241,10 @@ class ZephyrSquadApiClient:
                             )
                         time.sleep(_wait)
                         continue
+                    else:
+                        if self._cache is not None:
+                            self._cache.set("zapi", path, params, version, _payload)
+                        return _payload
                 if 400 <= response.status_code < 500 and response.status_code not in (408, 429):
                     raise APIError(
                         f"HTTP {response.status_code} (non-retryable) for {path!r}: "

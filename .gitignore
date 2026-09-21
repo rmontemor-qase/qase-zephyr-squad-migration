@@ -10,6 +10,18 @@ logs/
 stats/
 cache/
 
+# Belt and braces for the source response cache. cache/ already covers
+# cache/source_cache.db, but a root-level *.db was NOT ignored, and this cache
+# is a verbatim dump of customer Jira/Zephyr responses: test content, issue
+# keys, account ids, emails. Committing one is a customer data disclosure that
+# `git rm` does not undo — the blob stays readable by hash forever.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
 # Read-only preflight output — contains sampled CUSTOMER data (Zephyr/Jira responses).
 preflight_shapes.json
 

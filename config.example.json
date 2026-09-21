@@ -69,5 +69,9 @@
         "allow_existing_target": false,
         "delta": false,
         "qase_bulk_hydrate_case_ids": false
+    },
+    "cache": {
+        "enabled": false,
+        "dir": "./cache"
     }
 }

@@ -6,6 +6,12 @@ import requests
 from ..exceptions.api import APIError
 
 
+# Cache-miss sentinel, owned here so this module never imports the cache
+# (and therefore never imports sqlite3) on a run with the cache disabled.
+# Identity, not truthiness: a cached [], {}, 0 or None is a real hit.
+_CACHE_MISS = object()
+
+
 class JiraLookupClient:
     """READ-ONLY Jira REST client.
 
@@ -32,6 +38,7 @@ class JiraLookupClient:
         max_retries: int = 3,
         backoff_factor: float = 2.0,
         api_version: str = "2",
+        cache=None,
     ):
         self.base_url = (base_url or "").rstrip("/")
         self.auth = (email, api_token)
@@ -41,9 +48,19 @@ class JiraLookupClient:
         # api/2 returns description as a wiki-markup string (simpler to migrate);
         # api/3 returns it as an ADF document. Default to 2 for descriptions.
         self.api_version = str(api_version or "2")
+        # Opt-in read-through response cache. None = off, which is the default.
+        # Squad test cases ARE Jira issues, so caching only the ZAPI side would
+        # leave half the read cost in place.
+        self._cache = cache
 
     def _get(self, path: str, params: dict = None):
         url = f"{self.base_url}/{path.lstrip('/')}"
+        # The path already carries the API version, so path + params is the
+        # full request identity here.
+        if self._cache is not None:
+            _cached = self._cache.get("jira", path, params, None, _CACHE_MISS)
+            if _cached is not _CACHE_MISS:
+                return _cached
         for attempt in range(self.max_retries + 1):
             try:
                 response = requests.get(
@@ -55,9 +72,12 @@ class JiraLookupClient:
                 )
                 if 200 <= response.status_code < 300:
                     try:
-                        return response.json()
+                        _payload = response.json()
                     except (ValueError, requests.exceptions.JSONDecodeError) as e:
                         raise APIError(f"Non-JSON response from Jira {path!r}") from e
+                    if self._cache is not None:
+                        self._cache.set("jira", path, params, None, _payload)
+                    return _payload
                 # Fast-fail on deterministic client errors (any 4xx except 408/429)
                 if 400 <= response.status_code < 500 and response.status_code not in (408, 429):
                     raise APIError(
