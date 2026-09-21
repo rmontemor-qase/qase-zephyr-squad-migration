@@ -50,6 +50,20 @@ from qaseio.exceptions import ApiException
 
 
 class QaseService:
+    # Max results per create_result_bulk call.
+    #
+    # Qase is lowering the server-side bulk-results limit from 2000 to 200 to
+    # smooth load spikes. The generated client still validates client-side at
+    # 2000, so it will happily build a 1000-item body that the API then rejects.
+    # Sit at the new limit instead: a batch above it is a hard failure, and one
+    # oversized cycle must never take out a whole run's results again: a single
+    # 2962-result cycle lost every one of them exactly that way.
+    #
+    # Cost of the smaller batch is only extra HTTP calls, not extra data: the
+    # whole estate is ~126k results, so 200-item batches mean ~630 calls instead
+    # of ~126. Qase writes were never the bottleneck; Zephyr reads are.
+    _RESULT_BULK_CHUNK = 200
+
     def __init__(self, config: ConfigManager, logger: Logger):
         self.config = config
         self.logger = logger
@@ -141,6 +155,58 @@ class QaseService:
                 continue
         assert last_exc is not None
         raise last_exc
+
+    # ------------------------------------------------------------------
+    # Write-ahead spool
+    # ------------------------------------------------------------------
+    # Fetched results live only in memory until Qase accepts them. When a write
+    # fails the exception is logged and the data is discarded — which is how
+    # one 2962-result run lost all of them after they had already
+    # cost hours of Zephyr reads, and why recovering them needs ~32h of
+    # re-fetching. Spooling the payload to disk first turns any future write
+    # failure into a local retry instead of a re-fetch. The file is deleted the
+    # moment Qase confirms the write, so a clean run leaves nothing behind.
+    #
+    # The spool holds RAW CUSTOMER DATA (statuses, comments, attachment hashes).
+    # ``spool/`` is gitignored; keep it that way.
+
+    def _spool_dir(self) -> str:
+        return str(self.config.get("spool_dir") or "spool").strip() or "spool"
+
+    def _spool_write(self, code, run_id, payload) -> str:
+        """Persist a run's result payload before writing it. Returns the path, or ''.
+
+        Best-effort: a spool failure must never stop the migration, since the
+        spool is a safety net rather than the delivery path.
+        """
+        if self.config.get("spool_enabled") is False:
+            return ""
+        try:
+            d = self._spool_dir()
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, f"{code}_run{run_id}.spool.jsonl")
+            with open(path, "w", encoding="utf-8") as fh:
+                for row in payload:
+                    fh.write(json.dumps(row, default=str) + "\n")
+            self.logger.log(
+                f"[Spool] {len(payload)} result(s) for run {run_id} written to {path} "
+                f"(removed once Qase confirms)"
+            )
+            return path
+        except Exception as e:
+            self.logger.log(f"[Spool] could not spool run {run_id}: {e}", "warning")
+            return ""
+
+    def _spool_clear(self, path: str) -> None:
+        """Drop the spool file after a confirmed write; keep it if anything failed."""
+        if not path:
+            return
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            self.logger.log(f"[Spool] could not remove {path}: {e}", "warning")
 
     def _get_users(self, limit=100, offset=0):
         try:
@@ -1137,38 +1203,92 @@ class QaseService:
 
             if len(res) > 0:
                 api_results = ResultsApi(self.client)
-                self.logger.log(f'Sending {len(res)} results to Qase')
-                try:
-                    self._retry_io(
-                        f'Qase][Results][{qase_code}][run {qase_run_id}]',
-                        lambda: api_results.create_result_bulk(
-                            code=qase_code,
-                            id=int(qase_run_id),
-                            resultcreate_bulk=ResultcreateBulk(results=res),
-                        ),
+                # ResultcreateBulk is capped at 2000 items by the generated
+                # client's own pydantic validation. That cap is enforced BEFORE
+                # any HTTP call, so it raises ValidationError rather than
+                # ApiException and slips past the no-steps fallback below —
+                # which is how a 2962-result run silently lost every
+                # one of them behind a single [error] line.
+                # Chunk here so a large cycle degrades into several calls
+                # instead of losing the whole run.
+                # Write-ahead: on disk before the first call, gone after the last.
+                _spool = self._spool_write(qase_code, qase_run_id, res)
+                for start in range(0, len(res), self._RESULT_BULK_CHUNK):
+                    chunk = res[start:start + self._RESULT_BULK_CHUNK]
+                    self.logger.log(
+                        f'Sending {len(chunk)} results to Qase'
+                        + (f' (chunk {start // self._RESULT_BULK_CHUNK + 1}'
+                           f'/{-(-len(res) // self._RESULT_BULK_CHUNK)})'
+                           if len(res) > self._RESULT_BULK_CHUNK else '')
                     )
-                except ApiException as e:
-                    # A per-step payload Qase rejects (e.g. step count not
-                    # matching the case) must not cost the whole run its
-                    # results — retry once without steps.
-                    if any('steps' in r for r in res):
-                        self.logger.log(
-                            f'[Qase][Results] {qase_code} run {qase_run_id}: bulk with steps '
-                            f'rejected (status={getattr(e, "status", None)}); retrying without '
-                            f'step-level results', 'warning',
-                        )
-                        for r in res:
-                            r.pop('steps', None)
+                    try:
                         self._retry_io(
-                            f'Qase][Results][retry-no-steps][{qase_code}][run {qase_run_id}]',
-                            lambda: api_results.create_result_bulk(
+                            f'Qase][Results][{qase_code}][run {qase_run_id}]',
+                            lambda c=chunk: api_results.create_result_bulk(
                                 code=qase_code,
                                 id=int(qase_run_id),
-                                resultcreate_bulk=ResultcreateBulk(results=res),
+                                resultcreate_bulk=ResultcreateBulk(results=c),
                             ),
                         )
-                    else:
-                        raise
+                    except ApiException as e:
+                        # Size rejections are not fixable by reshaping the items,
+                        # so fail loudly with the real reason rather than blaming
+                        # step results. The spool still holds the payload.
+                        if self._is_batch_too_large(e):
+                            self.logger.log(
+                                f'[Qase][Results] {qase_code} run {qase_run_id}: bulk of '
+                                f'{len(chunk)} REJECTED FOR BATCH SIZE '
+                                f'(status={getattr(e, "status", None)}). Qase caps bulk '
+                                f'results at 200; lower _RESULT_BULK_CHUNK (currently '
+                                f'{self._RESULT_BULK_CHUNK}). Payload retained in the spool.',
+                                'error',
+                            )
+                            raise
+                        # A per-step payload Qase rejects (e.g. step count not
+                        # matching the case) must not cost the whole run its
+                        # results — retry once without steps.
+                        if any('steps' in r for r in chunk):
+                            self.logger.log(
+                                f'[Qase][Results] {qase_code} run {qase_run_id}: bulk with steps '
+                                f'rejected (status={getattr(e, "status", None)}); retrying without '
+                                f'step-level results', 'warning',
+                            )
+                            for r in chunk:
+                                r.pop('steps', None)
+                            self._retry_io(
+                                f'Qase][Results][retry-no-steps][{qase_code}][run {qase_run_id}]',
+                                lambda c=chunk: api_results.create_result_bulk(
+                                    code=qase_code,
+                                    id=int(qase_run_id),
+                                    resultcreate_bulk=ResultcreateBulk(results=c),
+                                ),
+                            )
+                        else:
+                            raise
+                # Every chunk confirmed. Only now is the spool redundant — leaving
+                # it on ANY failure is the point: the payload survives on disk so a
+                # retry costs seconds instead of re-fetching from Zephyr for hours.
+                self._spool_clear(_spool)
+
+    @staticmethod
+    def _is_batch_too_large(e) -> bool:
+        """True when Qase rejected a bulk write for BATCH SIZE, not payload shape.
+
+        Qase caps bulk results at 200 per request. A batch over that is refused
+        with an error naming the limit, and no amount of reshaping the items
+        fixes it — only splitting does. Telling it apart from a step-payload
+        rejection matters because the caller's remedy for the latter (strip
+        ``steps`` and resend) would otherwise resend the same oversized batch,
+        fail identically, and leave a log line blaming step results for what was
+        really a size problem.
+        """
+        status = getattr(e, "status", None)
+        if status not in (400, 413, 422):
+            return False
+        body = f"{getattr(e, 'body', '') or ''} {getattr(e, 'reason', '') or ''}".lower()
+        return any(k in body for k in (
+            "too many", "maximum", "max results", "batch size", "exceeds", "limit",
+        ))
 
     def prepare_result_steps(self, steps, status_map) -> list:
         allowed_statuses = ['passed', 'failed', 'blocked', 'skipped']
@@ -1222,7 +1342,7 @@ class QaseService:
 
         return total_seconds
 
-    def upload_attachment(self, code, attachment_data, max_attempts: int = 5):
+    def upload_attachment(self, code, attachment_data, max_attempts: int = 8):
         """Upload to Qase. ``attachment_data`` is a filesystem path (str), or ``(filename, bytes)``.
 
         The qaseio client accepts path strings or ``io.BytesIO`` with ``.name`` and ``.mime`` set;
@@ -1264,7 +1384,14 @@ class QaseService:
             except Exception as e:
                 last = repr(e)
             if attempt < max_attempts - 1:
-                wait = min(2 ** attempt, 15)
+                # Cap at 30s, matching the Zephyr read ladder. At the old 5x/15s
+                # cap the whole ladder finished inside ~15 seconds, so a brief
+                # local network blip outlived it: a DNS outage lasting seconds
+                # (four consecutive DNS failures resolving the Qase API host)
+                # permanently lost one attachment, the only one this
+                # migration dropped on the WRITE side. The read side survives the
+                # same conditions because it gets 8 attempts up to 30s apiece.
+                wait = min(2 ** attempt, 30)
                 self.logger.log(
                     f"Upload of {str(name)[:60]!r} failed ({last}); retrying in "
                     f"{wait}s (attempt {attempt + 1}/{max_attempts})",
