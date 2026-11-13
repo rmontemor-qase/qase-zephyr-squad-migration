@@ -1,77 +1,88 @@
 {
-    "qase": {
-        "api_token": "<QASE_API_TOKEN>",
-        "host": "qase.io",
-        "throttle_requests": 120,
-        "throttle_interval_sec": 12,
-        "rate_limit_max_retries": 8
-    },
-    "users": {
-        "default": 1,
-        "map": {},
-        "resolve_from_jira": true
-    },
-    "features": {
-        "component_custom_field": false,
-        "component_field_title": "Feature Area",
-        "component_field_fallback_option": "No Feature Area",
-        "single_suite": false,
-        "single_suite_title": "Migrated from Zephyr",
-        "required_field_defaults": {},
-        "shared_option_fields": true,
-        "labels_custom_field": true,
-        "fixversion_custom_field": true,
-        "case_milestone": false
-    },
-    "zephyr": {
-        "account_id": "<ATLASSIAN_ACCOUNT_ID>",
-        "access_key": "<ZAPI_ACCESS_KEY>",
-        "secret_key": "<ZAPI_SECRET_KEY>",
-        "base_url": "https://prod-api.zephyr4jiracloud.com/connect",
-        "max_requests_per_min": 30,
-        "attachments": {
-            "enabled": true
-        }
-    },
-    "jira": {
-        "base_url": "https://your-site.atlassian.net",
-        "email": "",
-        "api_token": ""
-    },
-    "projects": {
-        "import_all": false,
-        "import": [
-            "KEY1"
-        ],
-        "exclude": [],
-        "mapping": {}
-    },
-    "cases": {
-        "priority_map": {},
-        "jira_statuses": [],
-        "preserve_ids": true,
-        "comments_custom_field": false,
-        "comments_limit": 0,
-        "limit": 0,
-        "batch_size": 50,
-        "jira_custom_fields": {
-            "customfield_XXXXX": "Qase Field Title"
-        }
-    },
-    "runs": {
-        "status_map": {},
-        "concurrency": 6,
-        "step_results": true,
-        "step_result_attachments": false,
-        "jira_links_custom_field": true
-    },
-    "migration": {
-        "allow_existing_target": false,
-        "delta": false,
-        "qase_bulk_hydrate_case_ids": false
-    },
-    "cache": {
-        "enabled": false,
-        "dir": "./cache"
+  "qase": {
+    "api_token": "<QASE_API_TOKEN>",
+    "host": "qase.io",
+    "throttle_requests": 120,
+    "throttle_interval_sec": 12,
+    "rate_limit_max_retries": 8,
+    "scim_host": "app.qase.io",
+    "scim_token": "<workspace SCIM token, Enterprise only>"
+  },
+  "users": {
+    "default": 1,
+    "map": {},
+    "resolve_from_jira": true,
+    "create": false,
+    "source_file": "./users.json",
+    "projects": [],
+    "only_active": false,
+    "create_as_active": false,
+    "user_type": "regular"
+  },
+  "features": {
+    "component_custom_field": false,
+    "component_field_title": "Feature Area",
+    "component_field_fallback_option": "No Feature Area",
+    "single_suite": false,
+    "single_suite_title": "Migrated from Zephyr",
+    "required_field_defaults": {},
+    "shared_option_fields": true,
+    "labels_custom_field": true,
+    "fixversion_custom_field": true,
+    "case_milestone": false
+  },
+  "zephyr": {
+    "account_id": "<ATLASSIAN_ACCOUNT_ID>",
+    "access_key": "<ZAPI_ACCESS_KEY>",
+    "secret_key": "<ZAPI_SECRET_KEY>",
+    "base_url": "https://prod-api.zephyr4jiracloud.com/connect",
+    "max_requests_per_min": 30,
+    "attachments": {
+      "enabled": true
     }
+  },
+  "jira": {
+    "base_url": "https://your-site.atlassian.net",
+    "email": "",
+    "api_token": ""
+  },
+  "projects": {
+    "import_all": false,
+    "import": [
+      "KEY1"
+    ],
+    "exclude": [],
+    "mapping": {}
+  },
+  "cases": {
+    "priority_map": {},
+    "jira_statuses": [],
+    "preserve_ids": true,
+    "comments_custom_field": false,
+    "comments_limit": 0,
+    "limit": 0,
+    "batch_size": 50,
+    "jira_custom_fields": {
+      "customfield_XXXXX": "Qase Field Title"
+    }
+  },
+  "runs": {
+    "status_map": {},
+    "concurrency": 6,
+    "step_results": true,
+    "step_result_attachments": false,
+    "jira_links_custom_field": true
+  },
+  "migration": {
+    "allow_existing_target": false,
+    "delta": false,
+    "qase_bulk_hydrate_case_ids": false
+  },
+  "cache": {
+    "enabled": true,
+    "dir": "./cache",
+    "read": false,
+    "write": true,
+    "max_age_hours": 24
+  }
 }

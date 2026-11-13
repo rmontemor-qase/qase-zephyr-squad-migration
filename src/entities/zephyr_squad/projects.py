@@ -108,8 +108,11 @@ class Projects:
                     f"[Projects] Using mapped Qase project [{forced_code}] for Zephyr project {name} [{key}]"
                 )
             else:
+                gid = await self._ensure_access_group(key, name)
                 created = await self.pools.qs(
-                    self.qase.create_project, name, "", forced_code, self.mappings.group_id
+                    self.qase.create_project, self._title(name), "", forced_code,
+                    gid if gid is not None else self.mappings.group_id,
+                    self.config.get("projects.access") or "all",
                 )
                 if not created:
                     self.logger.log(
@@ -130,7 +133,7 @@ class Projects:
             return
 
         self.logger.log(f"[Projects] Importing project: {name} [{key}] (zephyr id={pid})")
-        code = await self._create_project(name, "")
+        code = await self._create_project(self._title(name), "", source_key=key)
         if code:
             _record(code)
         else:
@@ -187,7 +190,88 @@ class Projects:
         else:
             return postfix[:-1] + chr(ord(postfix[-1]) + 1)
 
-    async def _create_project(self, title: str, description: str) -> Optional[str]:
+
+    def _title(self, name: str) -> str:
+        """Project title, plus ``projects.title_suffix`` when set.
+
+        A Qase project cannot be renamed through the API (/project/{code} is
+        GET, HEAD and DELETE only), so the title has to be right at creation.
+        Used when the same source project is migrated twice under different
+        settings and the two need telling apart.
+        """
+        suffix = (self.config.get("projects.title_suffix") or "").strip()
+        return f"{name} {suffix}".strip() if suffix else name
+
+    async def _ensure_access_group(self, key: str, name: str):
+        """Create a SCIM group holding exactly the people who worked on this
+        Zephyr project, and return its id for ``access: "group"``.
+
+        Qase takes a group, never a user list, and project access cannot be
+        changed after creation, so this has to happen before the project exists.
+        Membership comes from ``users.source_file`` filtered to this project key.
+        The workspace owner keeps access regardless of group membership.
+        """
+        if not self.config.get("projects.access_group"):
+            return None
+        # A dry run must write NOTHING. The SCIM client is a real client, not the
+        # dry-run shim, so creating a group here would be a genuine side effect.
+        if type(self.qase).__name__.startswith("DryRun"):
+            self.logger.log(
+                f"[Projects] DRY RUN: would create an access group for {key} "
+                f"(no SCIM group created)")
+            return None
+        import json as _json, os as _os
+        from ...service.qase_scim import QaseScimService
+        path = self.config.get("users.source_file")
+        if not path or not _os.path.exists(path):
+            self.logger.log(
+                f"[Projects] projects.access_group is on but users.source_file is "
+                f"missing ({path!r}) — creating {key} with the default access", "error")
+            return None
+        with open(path, encoding="utf-8") as fh:
+            people = _json.load(fh)
+        wanted = sorted({
+            (u.get("email") or "").strip().lower() for u in people.values()
+            if (u.get("type") or "atlassian") == "atlassian"
+            and key in (u.get("projects") or [])
+            and (u.get("email") or "").strip()
+        })
+        if not wanted:
+            self.logger.log(
+                f"[Projects] no users recorded for {key} — creating with default access",
+                "warning")
+            return None
+        scim = QaseScimService(self.config, self.logger)
+        ids, missing = [], []
+        for email in wanted:
+            try:
+                found = await self.pools.qs(scim.find_user, email)
+            except Exception as e:
+                self.logger.log(f"[Projects] SCIM lookup failed for {email}: {e}", "warning")
+                found = None
+            (ids.append(found["id"]) if found and found.get("id") else missing.append(email))
+        if missing:
+            self.logger.log(
+                f"[Projects] {len(missing)} of {len(wanted)} {key} user(s) are not members of "
+                f"this workspace and will NOT get access: {missing[:5]}", "error")
+        if not ids:
+            return None
+        try:
+            gid = await self.pools.qs(
+                scim.create_group_with_members,
+                self.config.get("projects.access_group_prefix") or "", key, ids)
+        except Exception as e:
+            self.logger.log(
+                f"[Projects] could not create the access group for {key}: {e} — "
+                f"creating with the default access", "error")
+            return None
+        self.logger.log(
+            f"[Projects] access group for {key}: {len(ids)} of {len(wanted)} user(s) added "
+            f"(group {gid})")
+        return gid
+
+    async def _create_project(self, title: str, description: str,
+                              source_key: str = None) -> Optional[str]:
         existing = self._match_existing_project(title)
         if existing:
             self.logger.log(
@@ -201,8 +285,11 @@ class Projects:
             self.existing_codes.add(existing.upper())
             return existing
         code = self._short_code(title)
+        gid = await self._ensure_access_group(source_key, title) if source_key else None
         if await self.pools.qs(
-            self.qase.create_project, title, description, code, self.mappings.group_id
+            self.qase.create_project, title, description, code,
+            gid if gid is not None else self.mappings.group_id,
+            self.config.get("projects.access") or "all",
         ):
             return code
         return None
