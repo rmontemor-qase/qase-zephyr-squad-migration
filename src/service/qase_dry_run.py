@@ -21,8 +21,11 @@ class DryRunQaseService(QaseService):
 
     # ---- writes: logged, never sent ----------------------------------
 
-    def create_project(self, title, description, code, group_id=None):
-        self._dry(f"would create project {title!r} [{code}]")
+    def create_project(self, title, description, code, group_id=None, access=None):
+        # Surface the access decision: it is settable only at creation and
+        # unreadable afterwards, so a dry run is the only chance to check it.
+        where = f", access=group, group={group_id}" if group_id else f", access={access or 'default'}"
+        self._dry(f"would create project {title!r} [{code}]{where}")
         return True
 
     def create_suite(self, code, title, description, parent_id=None):

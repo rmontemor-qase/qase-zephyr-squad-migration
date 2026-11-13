@@ -83,6 +83,43 @@ class QaseService:
 
         self.client = ApiClient(configuration)
 
+        # Every Qase request gets a finite timeout. The SDK defaults
+        # _request_timeout to None, which is an INFINITE wait, and macOS does not
+        # apply TCP keepalive unless a socket asks for it. A migration can therefore
+        # hang permanently: worker threads blocked on Qase sockets with empty
+        # queues, zero CPU, and no layer able to break it. call_api is the single funnel every
+        # generated API method goes through, so defaulting it here covers them all
+        # without touching ~40 call sites; sites that pass their own value keep it.
+        _conn_t = float(self.config.get("qase.connect_timeout_sec") or 30)
+        _read_t = float(self.config.get("qase.read_timeout_sec") or 180)
+        _orig_call_api = self.client.call_api
+
+        def _call_api_with_timeout(*args, **kwargs):
+            if kwargs.get("_request_timeout") is None and len(args) < 6:
+                kwargs["_request_timeout"] = (_conn_t, _read_t)
+            return _orig_call_api(*args, **kwargs)
+
+        self.client.call_api = _call_api_with_timeout
+
+        # qaseio passes no `retries`, so urllib3 silently retries a GET three
+        # times before our handler ever sees it: with a 300s read timeout that is
+        # 20 minutes of invisible stalling per call. Hand retry policy to
+        # _retry_io, which logs every attempt and already distinguishes
+        # idempotent from non-idempotent operations. urllib3 then raises the
+        # underlying error immediately instead of swallowing it into a retry loop.
+        try:
+            import urllib3 as _u3
+            self.client.rest_client.pool_manager.connection_pool_kw["retries"] = (
+                _u3.Retry(total=0, read=False, connect=False, redirect=3, raise_on_status=False)
+            )
+        except Exception as _e:                     # never fail construction over this
+            self.logger.log(f"[Qase] could not set urllib3 retry policy: {_e}", "warning")
+
+        self.logger.log(
+            f"[Qase] request timeout: connect={_conn_t:.0f}s read={_read_t:.0f}s, "
+            f"retries handled by _retry_io"
+        )
+
     @staticmethod
     def _retry_after_seconds(exc) -> float:
         """``Retry-After`` (seconds) from a Qase 429, or 0.0 when absent/unparseable."""
@@ -98,7 +135,7 @@ class QaseService:
         except (TypeError, ValueError):
             return 0.0
 
-    def _retry_io(self, label: str, fn):
+    def _retry_io(self, label: str, fn, idempotent: bool = True):
         """Retry Qase SDK calls on transient TCP/TLS failures AND on HTTP 429.
 
         429 must be retried, not raised: Qase throttles hard on large imports (a
@@ -116,7 +153,40 @@ class QaseService:
             try:
                 return fn()
             except ApiException as e:
-                if int(getattr(e, "status", 0) or 0) != 429:
+                _status = int(getattr(e, "status", 0) or 0)
+                # 5xx is as transient as 429 and just as destructive if it escapes.
+                # When Qase returns 503/504 for a couple of minutes, run creations
+                # are otherwise abandoned and their results are lost with them.
+                # Treat gateway/unavailable exactly like a rate limit: wait and retry.
+                # 502/503 mean the request never reached the application
+                # ("no available server"), so retrying cannot duplicate anything.
+                #
+                # 504 is different and the distinction matters: the gateway gave
+                # up waiting for a response the server may well have produced.
+                # Retrying a 504 on a CREATE duplicates the record. So a
+                # 504 is only retried when the caller says the operation is safe
+                # to repeat; otherwise it is raised and the caller decides.
+                if _status in (502, 503) or (_status == 504 and idempotent):
+                    last_exc = e
+                    if rl_attempt >= rl_max_retries:
+                        self.logger.log(
+                            f'[{label}] HTTP {_status} after {rl_attempt} retry(ies) — giving up',
+                            'error')
+                        raise
+                    delay = min(backoff * (2 ** rl_attempt), 60.0)
+                    rl_attempt += 1
+                    self.logger.log(
+                        f'[{label}] Qase HTTP {_status} (retry {rl_attempt}/{rl_max_retries}); '
+                        f'waiting {delay:.1f}s', 'warning')
+                    time.sleep(delay)
+                    continue
+                if _status == 504:
+                    self.logger.log(
+                        f'[{label}] HTTP 504 on a non-idempotent call — NOT retrying, the '
+                        f'server may have completed it. Raising so the caller can check.',
+                        'error')
+                    raise
+                if _status != 429:
                     raise
                 last_exc = e
                 if rl_attempt >= rl_max_retries:
@@ -136,12 +206,39 @@ class QaseService:
             except (
                 urllib3.exceptions.ProtocolError,
                 urllib3.exceptions.ReadTimeoutError,
+                # urllib3 applies its default Retry(3) because qaseio passes no
+                # `retries`, so an exhausted GET surfaces as MaxRetryError, which
+                # is NOT an OSError and was escaping this handler entirely. POSTs
+                # are not in urllib3's retryable methods so they raise
+                # ReadTimeoutError directly; both paths must be caught or the
+                # request timeout turns one failure mode (hang) into another (crash).
+                urllib3.exceptions.MaxRetryError,
+                urllib3.exceptions.TimeoutError,
                 ConnectionError,
                 TimeoutError,
                 BrokenPipeError,
                 OSError,
             ) as e:
                 last_exc = e
+                # A READ timeout means the request REACHED Qase and only the
+                # response was lost, so the write may well have completed —
+                # retrying a non-idempotent call then duplicates it. That is
+                # exactly what produces empty duplicate runs while the log
+                # reports every run created.
+                # Connection-level failures never reached the server, so they
+                # stay safe to retry whatever the caller says.
+                _reached_server = isinstance(
+                    e, (urllib3.exceptions.ReadTimeoutError, urllib3.exceptions.TimeoutError)
+                ) or (
+                    isinstance(e, urllib3.exceptions.MaxRetryError)
+                    and "ReadTimeout" in repr(e)
+                )
+                if _reached_server and not idempotent:
+                    self.logger.log(
+                        f'[{label}] read timeout on a NON-IDEMPOTENT call — not retrying, '
+                        f'the server may have completed it. Raising so the caller can check.',
+                        'error')
+                    raise
                 if attempt >= max_retries:
                     break
                 delay = min(backoff * (2 ** attempt), 60.0)
@@ -221,21 +318,26 @@ class QaseService:
     def get_all_users(self, limit=100):
         offset = 0
         while True:
-            result = self._get_users(limit, offset)
-            yield result
+            page = self._get_users(limit, offset) or []
+            yield page
+            if len(page) < limit:
+                return
             offset += limit
-            if len(result) < limit:
-                break
 
     def get_all_users_sync(self, limit=100):
-        offset = 0
-        result = []
+        """Every workspace member, paginated.
+
+        Authorship is matched against this list and is write-once at creation,
+        so a short read here silently sends people to ``users.default`` with no
+        way back. Page until a short page says we are done.
+        """
+        offset, result = 0, []
         while True:
-            result = result.extend(self._get_users(limit, offset))
+            page = self._get_users(limit, offset) or []
+            result.extend(page)
+            if len(page) < limit:
+                return result
             offset += limit
-            if len(result) < limit:
-                break
-        return result
 
     def get_case_custom_fields(self):
         return self.get_custom_fields_for('case')
@@ -434,7 +536,7 @@ class QaseService:
         except ApiException as e:
             self.logger.log("Exception when calling ProjectsApi->get_projects: %s\n" % e)
 
-    def create_project(self, title, description, code, group_id=None):
+    def create_project(self, title, description, code, group_id=None, access=None):
         api_instance = ProjectsApi(self.client)
 
         data = {
@@ -448,32 +550,86 @@ class QaseService:
             }
         }
 
+        # Project access is settable ONLY at creation: v1 exposes no way to read
+        # it back or change it afterwards. 'access' takes all | group | none, and
+        # there is no per-user field — a members array is accepted with a 200 and
+        # silently ignored (verified against the live API). A group is the only way
+        # to scope a project to specific people.
         if group_id is not None:
-            data['group'] = group_id
+            data['group'] = str(group_id)
+            data['access'] = 'group'
+        elif access:
+            data['access'] = access
 
         self.logger.log(f'Creating project: {title} [{code}]')
-        try:
-            api_response = api_instance.create_project(
-                project_create=ProjectCreate(**data)
-            )
-            self.logger.log(f'Project was created: {api_response.result.code}')
-            return True
-        except ApiException as e:
-            try:
-                error = json.loads(e.body) if e.body else {}
-            except (ValueError, TypeError):
-                error = {}
-            error_fields = error.get('errorFields') or []
-            if (
-                error.get('status') is False
-                and error_fields
-                and error_fields[0].get('error') == 'Project with the same code already exists.'
-            ):
-                self.logger.log(f'Project with the same code already exists: {code}. Using existing project.')
-                return True
 
-            self.logger.log('Exception when calling ProjectsApi->create_project: %s\n' % e)
+        def _exists() -> bool:
+            """Did the project land despite the error? A 504/timeout on create
+            means the server may have completed it."""
+            try:
+                page = self.get_projects(100, 0)
+                ents = getattr(page, 'entities', None) or []
+                for e in ents:
+                    d = e.to_dict() if hasattr(e, 'to_dict') else e
+                    if str(d.get('code', '')).upper() == str(code).upper():
+                        return True
+            except Exception:
+                pass
             return False
+
+        # Project creation was the ONE write not wrapped in retry/backoff, so a
+        # single transient 502/504 aborted the whole migration at its first step
+        # ("No projects to migrate"). Retry like every other write,
+        # and because create is not idempotent, check for the project before each
+        # retry rather than blindly creating a second one.
+        _tries = int(self.config.get('qase.project_create_retries', 5) or 5)
+        _last = None
+        for _attempt in range(_tries + 1):
+            try:
+                api_response = api_instance.create_project(
+                    project_create=ProjectCreate(**data)
+                )
+                self.logger.log(f'Project was created: {api_response.result.code}')
+                return True
+            except Exception as _e:
+                _status = int(getattr(_e, 'status', 0) or 0)
+                _transient = _status in (429, 500, 502, 503, 504) or not isinstance(_e, ApiException)
+                if not _transient or _attempt >= _tries:
+                    _last = _e
+                    break
+                if _exists():
+                    self.logger.log(
+                        f'Project [{code}] exists after a transient {_status or type(_e).__name__} '
+                        f'— adopting it rather than creating a duplicate'
+                    )
+                    return True
+                _wait = min(2 * (2 ** _attempt), 60.0)
+                self.logger.log(
+                    f'[Qase][Project][create][{code}] transient '
+                    f'{_status or type(_e).__name__} (retry {_attempt + 1}/{_tries}); '
+                    f'waiting {_wait:.0f}s', 'warning'
+                )
+                time.sleep(_wait)
+        # Last chance: the final failure may still have created it.
+        if _exists():
+            self.logger.log(f'Project [{code}] exists after the final failure — adopting it')
+            return True
+        e = _last
+        try:
+            error = json.loads(e.body) if getattr(e, 'body', None) else {}
+        except (ValueError, TypeError):
+            error = {}
+        error_fields = error.get('errorFields') or []
+        if (
+            error.get('status') is False
+            and error_fields
+            and error_fields[0].get('error') == 'Project with the same code already exists.'
+        ):
+            self.logger.log(f'Project with the same code already exists: {code}. Using existing project.')
+            return True
+
+        self.logger.log('Exception when calling ProjectsApi->create_project: %s\n' % e)
+        return False
 
     def create_suite(self, code: str, title: str, description: str, parent_id=None) -> int:
         api_instance = SuitesApi(self.client)
@@ -719,7 +875,7 @@ class QaseService:
                 _request_auth=None,
             )
             response_data = self._retry_io(
-                f"Qase][Cases][{code}]",
+                f"[Qase][Cases][{code}]",
                 lambda: self.client.call_api(
                     method,
                     url,
@@ -728,6 +884,7 @@ class QaseService:
                     post_params=post_params,
                     _request_timeout=None,
                 ),
+                idempotent=False,   # POST /case/bulk: a 504 retry would duplicate cases
             )
             api_response = self._parse_bulk_case_response(
                 code, chunk_num, n_chunks, response_data
@@ -887,7 +1044,8 @@ class QaseService:
                         description=description or None,
                     ),
                 ),
-            )
+                idempotent=False,
+                )
             if getattr(resp, "status", False) and getattr(resp, "result", None):
                 return int(resp.result.id)
         except ApiException as e:
@@ -1036,14 +1194,124 @@ class QaseService:
             # via _retry_io so a Qase 429 is waited out instead of silently
             # dropping the run (see _retry_io)
             response = self._retry_io(
-                f'Qase][Run][create][{project_code}]',
+                f'[Qase][Run][create][{project_code}]',
                 lambda: api_instance.create_run(
                     code=project_code, run_create=RunCreate(**data)
                 ),
+                idempotent=False,      # creating a run twice is worse than not at all
             )
             return response.result.id
         except Exception as e:
+            # A 504 means the gateway stopped waiting, NOT that nothing happened.
+            # Retrying blind duplicates runs, so instead look and see:
+            # if the run is there, adopt it; if not, report the failure honestly.
+            # A read timeout is the same situation as a 504: the request reached
+            # Qase and the write may have completed, we just never saw the answer.
+            # Treat both identically — settle, look, adopt — or the run is reported
+            # "not created" while it quietly exists.
+            _timed_out = isinstance(
+                e, (urllib3.exceptions.ReadTimeoutError, urllib3.exceptions.TimeoutError)
+            ) or (isinstance(e, urllib3.exceptions.MaxRetryError) and "ReadTimeout" in repr(e))
+            if int(getattr(e, 'status', 0) or 0) == 504 or _timed_out:
+                # Read-after-write lag: looking immediately reports "not created"
+                # for runs that DID land, so the log undercounts what Qase holds.
+                # The results path already waits before its lookup; this one did
+                # not. Settle, then retry the lookup with a widening gap.
+                _settle = float(self.config.get("qase.post_504_settle_sec", 5) or 5)
+                _tries = int(self.config.get("qase.post_504_lookup_tries", 4) or 4)
+                found = None
+                for _a in range(max(1, _tries)):
+                    if _settle > 0:
+                        time.sleep(_settle * (_a + 1))
+                    found = self._find_run_by_title(project_code, data.get('title'))
+                    if found is not None:
+                        if _a:
+                            self.logger.log(
+                                f'[Qase][Run][create][{project_code}] run '
+                                f'{data.get("title")!r} appeared on lookup attempt {_a + 1} '
+                                f'— read-after-write lag, not a loss', 'warning')
+                        break
+                if found is not None:
+                    self.logger.log(
+                        f'[Qase][Run][create][{project_code}] 504 on create, but the run '
+                        f'{data.get("title")!r} exists as id {found} — adopting it rather than '
+                        f'creating a duplicate', 'warning')
+                    return found
+                self.logger.log(
+                    f'[Qase][Run][create][{project_code}] 504 on create and no matching run '
+                    f'found for {data.get("title")!r} — treating as not created', 'error')
+                return None
             self.logger.log(f'Exception when calling RunsApi->create_run: {e}', 'error')
+
+    def _results_missing_after_504(self, qase_code, qase_run_id, chunk):
+        """Which of ``chunk`` has no result on the run yet.
+
+        Called only after a 504 on a results POST, where the chunk may have
+        landed in whole or in part. Compares by case id, which is what a result
+        is keyed on within a run. On any read failure it returns the whole chunk,
+        because re-posting is recoverable (duplicates are detectable and
+        deletable) while silently dropping results is not.
+        """
+        # Qase has just 504'd, so a read issued immediately can miss writes that
+        # did land. Give it a moment to settle: without this, results that WERE
+        # written read as missing and get posted twice.
+        # Not a guarantee — read-after-write here is best effort, which is why the
+        # post-run verification checks for duplicates as well as for shortfalls.
+        settle = float(self.config.get("qase.post_504_settle_sec", 5) or 5)
+        if settle > 0:
+            time.sleep(settle)
+        try:
+            api = ResultsApi(self.client)
+            have, offset = set(), 0
+            while True:
+                resp = self._retry_io(
+                    f'[Qase][Results][lookup][{qase_code}][run {qase_run_id}]',
+                    lambda: api.get_results(code=qase_code, run=str(qase_run_id),
+                                            limit=100, offset=offset),
+                )
+                ents = getattr(getattr(resp, 'result', None), 'entities', None) or []
+                for r in ents:
+                    cid = getattr(r, 'case_id', None)
+                    if cid is not None:
+                        have.add(int(cid))
+                if len(ents) < 100:
+                    break
+                offset += len(ents)
+            return [r for r in chunk if int(r.get('case_id', -1)) not in have]
+        except Exception as e:
+            self.logger.log(
+                f'[Qase][Results][lookup][{qase_code}][run {qase_run_id}] failed: {e} — '
+                f'assuming nothing landed', 'warning')
+            return list(chunk)
+
+    def _find_run_by_title(self, project_code: str, title):
+        """Newest run id whose title matches exactly, or None.
+
+        Only called after a 504 on create, so the cost of listing runs is paid
+        rarely and only to avoid a duplicate or a silent loss.
+        """
+        if not title:
+            return None
+        try:
+            api = RunsApi(self.client)
+            offset, best = 0, None
+            while True:
+                resp = self._retry_io(
+                    f'[Qase][Run][lookup][{project_code}]',
+                    lambda: api.get_runs(code=project_code, limit=100, offset=offset),
+                )
+                ents = getattr(getattr(resp, 'result', None), 'entities', None) or []
+                for r in ents:
+                    if getattr(r, 'title', None) == title:
+                        rid = getattr(r, 'id', None)
+                        if rid is not None and (best is None or rid > best):
+                            best = rid
+                if len(ents) < 100:
+                    return best
+                offset += len(ents)
+        except Exception as e:
+            self.logger.log(f'[Qase][Run][lookup][{project_code}] failed: {e}', 'warning')
+            return None
 
     def complete_run(self, project_code: str, run_id: int) -> bool:
         """POST ``/run/{code}/{id}/complete`` — Qase marks a run completed (separate from create-time flags)."""
@@ -1223,14 +1491,52 @@ class QaseService:
                     )
                     try:
                         self._retry_io(
-                            f'Qase][Results][{qase_code}][run {qase_run_id}]',
+                            f'[Qase][Results][{qase_code}][run {qase_run_id}]',
                             lambda c=chunk: api_results.create_result_bulk(
                                 code=qase_code,
                                 id=int(qase_run_id),
                                 resultcreate_bulk=ResultcreateBulk(results=c),
                             ),
+                            # Posting a results chunk twice creates duplicate rows:
+                            # a 504 retry adds extra results. 502/503
+                            # are still retried (the request never reached the app).
+                            idempotent=False,
                         )
                     except ApiException as e:
+                        # A 504 means the gateway gave up waiting, not that Qase
+                        # did nothing: the chunk may be fully, partly or not at
+                        # all written. Retrying blind duplicates results; raising
+                        # loses them. So read back what landed
+                        # and post only what is genuinely missing.
+                        if int(getattr(e, 'status', 0) or 0) == 504:
+                            missing = self._results_missing_after_504(
+                                qase_code, qase_run_id, chunk)
+                            if not missing:
+                                self.logger.log(
+                                    f'[Qase][Results][{qase_code}][run {qase_run_id}] 504 on '
+                                    f'post, but all {len(chunk)} result(s) are present — '
+                                    f'nothing to redo', 'warning')
+                                continue
+                            self.logger.log(
+                                f'[Qase][Results][{qase_code}][run {qase_run_id}] 504 on post; '
+                                f'{len(chunk) - len(missing)} of {len(chunk)} landed, '
+                                f're-posting the {len(missing)} that did not', 'warning')
+                            try:
+                                self._retry_io(
+                                    f'[Qase][Results][recover][{qase_code}][run {qase_run_id}]',
+                                    lambda c=missing: api_results.create_result_bulk(
+                                        code=qase_code,
+                                        id=int(qase_run_id),
+                                        resultcreate_bulk=ResultcreateBulk(results=c),
+                                    ),
+                                    idempotent=False,
+                                )
+                                continue
+                            except ApiException:
+                                self.logger.log(
+                                    f'[Qase][Results][{qase_code}][run {qase_run_id}] recovery '
+                                    f'post also failed; payload retained in the spool', 'error')
+                                raise
                         # Size rejections are not fixable by reshaping the items,
                         # so fail loudly with the real reason rather than blaming
                         # step results. The spool still holds the payload.
@@ -1256,12 +1562,13 @@ class QaseService:
                             for r in chunk:
                                 r.pop('steps', None)
                             self._retry_io(
-                                f'Qase][Results][retry-no-steps][{qase_code}][run {qase_run_id}]',
+                                f'[Qase][Results][retry-no-steps][{qase_code}][run {qase_run_id}]',
                                 lambda c=chunk: api_results.create_result_bulk(
                                     code=qase_code,
                                     id=int(qase_run_id),
                                     resultcreate_bulk=ResultcreateBulk(results=c),
                                 ),
+                                idempotent=False,   # still a results POST
                             )
                         else:
                             raise
