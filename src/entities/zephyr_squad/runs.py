@@ -1,3 +1,4 @@
+from datetime import datetime
 import asyncio
 import re
 
@@ -44,6 +45,44 @@ class Runs:
     def import_runs(self) -> Mappings:
         return asyncio.run(self._import_runs_async())
 
+    async def _attach_cycle_creators(self, code: str, project_id, cycles: dict):
+        """Record who CREATED each Zephyr cycle, so the Qase run carries a real author.
+
+        The execution payload names who executed a test, not who set up the cycle,
+        so a run had no author of its own and fell back to ``users.default``. The
+        creator lives on the cycle object instead: one ``cycles/search`` call per
+        version, which is cheap and cached. Cycles created before Zephyr recorded
+        the field have no creator and still fall back.
+        """
+        if not project_id:
+            return
+        versions = {str(c.get("version_id") or "-1") for c in cycles.values()}
+        versions.add("-1")
+        creators = {}
+        for vid in sorted(versions):
+            try:
+                found = await self.pools.source(self.zephyr.get_cycles, project_id, vid) or []
+            except Exception as e:
+                self.logger.log(
+                    f"[{code}][Runs] cycle creators unavailable for version {vid}: {e}",
+                    "warning")
+                continue
+            for cyc in found:
+                cid = cyc.get("id") or cyc.get("cycleId")
+                who = cyc.get("createdByAccountId") or cyc.get("createdBy")
+                if cid and who:
+                    creators[str(cid)] = str(who).strip()
+        hit = 0
+        for key, c in cycles.items():
+            cid = str(key[0]) if isinstance(key, tuple) else str(key)
+            who = creators.get(cid)
+            if who:
+                c["author_account"] = who
+                hit += 1
+        self.logger.log(
+            f"[{code}][Runs] cycle creator resolved for {hit}/{len(cycles)} run(s); "
+            f"the rest fall back to users.default")
+
     async def _resolve_executors(self, code: str, cycles: dict):
         """Map the Atlassian account ids that executed tests onto EXISTING Qase users.
 
@@ -60,6 +99,12 @@ class Runs:
             for cyc in cycles.values()
             for r in cyc["results"]
             if r.get("created_by")
+        }
+        # Cycle creators need resolving too, or the run author would fall back
+        # even when Zephyr told us who it was.
+        account_ids |= {
+            str(c["author_account"]).strip()
+            for c in cycles.values() if c.get("author_account")
         }
         pending = [
             a for a in account_ids
@@ -106,19 +151,47 @@ class Runs:
             f"(id={self.mappings.default_user})"
         )
 
-    @staticmethod
-    def _exec_comment(ex: dict) -> str:
-        """Tester note typed on a Zephyr execution → plain-text result comment.
+    def _exec_comment(self, ex: dict) -> str:
+        """Tester note on a Zephyr execution → plain-text result comment.
 
-        The execution payload carries the note under ``comment`` (some tenants
-        also expose ``htmlComment``); it rides along in the ``/executions`` fetch
-        we already make, so no extra request. Light HTML is stripped for parity
-        with step text.
+        Carries two further audit facts Zephyr records per EXECUTION and Qase
+        has no field for:
+
+          * the cycle FOLDER the execution sat under (``folderName``), which is
+            how the testers themselves group work and what they read a pass/fail
+            against;
+          * the Jira DEFECTS raised against that execution (``defects`` and
+            ``stepDefects``), as opposed to the run-level roll-up, which cannot
+            say which execution produced which bug.
+
+        Both ride along in the ``/executions`` payload already fetched, so
+        neither costs a request. They land in the comment because a Qase result
+        has no custom fields, and because PATCHing a result afterwards
+        overwrites its execution date with the time of the patch — verified on a
+        throwaway — so creation is the only safe moment to record them.
         """
         raw = ex.get("comment") or ex.get("htmlComment") or ""
         if not isinstance(raw, str):
             raw = str(raw)
-        return _strip_html(raw).strip()
+        parts = [_strip_html(raw).strip()]
+
+        if getattr(self, "_want_exec_folder", False):
+            folder = str(ex.get("folderName") or "").strip()
+            if folder:
+                parts.append(f"Folder: {folder}")
+
+        if getattr(self, "_want_exec_defects", False):
+            defects = self._exec_defects(ex)
+            if defects:
+                base = (self.config.get("jira.base_url") or "").rstrip("/")
+                lines = [
+                    f"{key} — {summary} — {base}/browse/{key}" if base
+                    else f"{key} — {summary}"
+                    for key, summary in defects
+                ]
+                parts.append("Defects:\n" + "\n".join(lines))
+
+        return "\n\n".join(p for p in parts if p)
 
     async def _step_defs(self, code: str, issue_id, project_id) -> dict:
         """``{stepId: {"order", "action", "data", "expected_result"}}`` for a test.
@@ -147,13 +220,17 @@ class Runs:
                 raw = []
         else:
             self._stepdef_hits[0] += 1
+        # Same rule as the case steps: cases.step_text_limit, default 0 = no cut.
+        _lim = self.config.get("cases.step_text_limit") if getattr(self, "config", None) is not None else None
+        lim = 0 if _lim is None else int(_lim)
         defs = {}
         for st in raw:
             if not isinstance(st, dict) or st.get("id") is None:
                 continue
+            action = _strip_html(str(st.get("step") or "")).strip() or "Step"
             defs[str(st["id"])] = {
                 "order": st.get("orderId") or 0,
-                "action": (_strip_html(str(st.get("step") or "")).strip() or "Step")[:1000],
+                "action": action[:lim] if lim > 0 else action,
                 "data": (_strip_html(str(st.get("data") or "")).strip() or None),
                 "expected_result": (_strip_html(str(st.get("result") or "")).strip() or None),
             }
@@ -352,6 +429,58 @@ class Runs:
 
     _JIRA_KEY = re.compile(r"^[A-Z][A-Z0-9]*-\d+$")
 
+    async def _append_defects_to_cases(self, code, cases_map, issue_defects):
+        """Add the bugs found while TESTING a case onto that case's Jira Links.
+
+        Zephyr records a defect against the EXECUTION, not against the test
+        issue, so these never appear in Jira's own ``issuelinks`` and so never
+        reach the case through the Cases phase. Without this a tester
+        searching a case for a bug key finds nothing, even though that bug was
+        raised against this very test.
+
+        The existing value is taken from what the Cases phase already wrote, so
+        no case has to be read back, and keys already present are skipped.
+        Off via ``runs.defects_on_cases``.
+        """
+        if self.config.get("runs.defects_on_cases") is False:
+            return
+        fid = getattr(self.mappings, "jira_links_field_id", None)
+        if not (fid and issue_defects):
+            return
+        stored = (self.mappings.case_jira_links.get(code) or {})
+        base = str(self.config.get("jira.base_url") or "").rstrip("/")
+        updated = failed = 0
+
+        async def push(issue_id, defects):
+            nonlocal updated, failed
+            case_id = cases_map.get(issue_id) or cases_map.get(str(issue_id))
+            if not case_id:
+                return
+            existing = stored.get(str(issue_id), "") or ""
+            have = set(re.findall(r"\b[A-Z][A-Z0-9]*-\d+\b", existing))
+            lines = [
+                f"defect found testing this case {k} — "
+                + (f"{base}/browse/{k}" if base else k)
+                for k in sorted(defects) if k not in have
+            ]
+            if not lines:
+                return
+            merged = "\n".join(([existing] if existing.strip() else []) + lines)
+            ok = await self.pools.qs(
+                self.qase.update_case_fields, code, int(case_id),
+                {"custom_field": {str(fid): merged}},
+            )
+            if ok:
+                updated += 1
+            else:
+                failed += 1
+
+        await asyncio.gather(*[push(i, d) for i, d in issue_defects.items()])
+        self.logger.log(
+            f"[{code}][Runs] execution defects added to {updated} case(s)"
+            + (f"; {failed} failed" if failed else "")
+        )
+
     @classmethod
     def _exec_defects(cls, ex: dict) -> list:
         """Jira defect keys linked to one execution.
@@ -374,6 +503,14 @@ class Runs:
                 if key and cls._JIRA_KEY.match(key):
                     out.append((key, (d.get("summary") or "").strip()))
         return out
+
+    @staticmethod
+    def _iso(epoch_sec) -> str:
+        """Epoch seconds → 'YYYY-MM-DD HH:MM:SS' in UTC ('unknown' when absent)."""
+        try:
+            return datetime.utcfromtimestamp(int(epoch_sec)).strftime("%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError, OSError, OverflowError):
+            return "unknown"
 
     @staticmethod
     def _sec(ms) -> int:
@@ -413,16 +550,36 @@ class Runs:
         self._want_step_atts = bool(_want_atts) and bool(
             self.config.get("runs.step_result_attachments")
         )
+        # Folder and per-execution defects cost NOTHING extra: both fields ride
+        # along in the /executions payload already fetched above. They default
+        # ON because Qase has no field for either and audits need them, but
+        # they stay switchable like everything else here.
+        self._want_exec_folder = self.config.get("runs.execution_folder") is not False
+        # runs.folder_as_run — give each cycle FOLDER its own Qase run, titled
+        # "[Cycle] Folder". Default OFF because it roughly doubles the run count.
+        #
+        # Worth turning on when folders carry meaning rather than just grouping.
+        # For example, when a "Run 1" folder holds every test and a "Run 2"
+        # folder holds only the retests of Run 1's failures, collapsing them into
+        # one run hides the failures behind their own retest: Qase shows the
+        # newest execution per case, and the passing Run 2 retest is newer.
+        # Split, each folder keeps its own verdict and its own counts.
+        self._folder_as_run = bool(self.config.get("runs.folder_as_run"))
+        self._want_exec_defects = self.config.get("runs.execution_defects") is not False
         # [step results, execution attachments, defect links, step attachments]
         nonlocal_steps = [0, 0, 0, 0]
         # stepId -> definition, per issue (one ZAPI call per TEST, not per execution)
+        issue_defects = {}   # {jira_issue_id: {defect_key: summary}}
         self._stepdef_cache = {}
         self._stepdef_hits = [0]
         self._stepdef_misses = [0]
         self.logger.log(
             f"[{code}][Runs] step results: {'ON' if _want_steps else 'OFF'} | "
             f"execution attachments: {'ON' if _want_atts else 'OFF'} | "
-            f"step-result attachments: {'ON' if self._want_step_atts else 'OFF'}"
+            f"step-result attachments: {'ON' if self._want_step_atts else 'OFF'} | "
+            f"execution folder: {'ON' if self._want_exec_folder else 'OFF'} | "
+            f"execution defects: {'ON' if self._want_exec_defects else 'OFF'} | "
+            f"folder as run: {'ON' if self._folder_as_run else 'OFF'}"
         )
 
         async def fetch(issue_id):
@@ -452,15 +609,30 @@ class Runs:
                     cid = ex.get("cycleId")
                     if cid is None:
                         continue
+                    cname = ex.get("cycleName") or f"Cycle {cid}"
+                    # One run per cycle, or per cycle+folder when folder_as_run
+                    # is on. Executions with no folder keep the cycle-level run
+                    # either way, so nothing is stranded.
+                    fname = str(ex.get("folderName") or "").strip()
+                    if self._folder_as_run and fname:
+                        key = (cid, ex.get("folderId") or fname)
+                        title = f"[{cname}] {fname}"
+                    else:
+                        key, title = (cid, None), cname
                     cyc = cycles.setdefault(
-                        cid, {"name": ex.get("cycleName") or f"Cycle {cid}",
+                        key, {"name": title,
                               "results": [], "ts": [], "version_id": None,
                               "defects": {}}
                     )
                     # Jira defects raised anywhere in this cycle, de-duplicated
                     # by key (the same defect commonly spans several executions).
+                    # Also keep them per TEST, so the case can carry the bugs
+                    # that testing IT produced.
                     for dkey, dsummary in self._exec_defects(ex):
                         cyc["defects"].setdefault(dkey, dsummary)
+                        issue_defects.setdefault(
+                            str(ex.get("issueId")), {}
+                        ).setdefault(dkey, dsummary)
                     # Jira fix version of this cycle -> Qase milestone (release
                     # traceability). -1 is Zephyr's "Unscheduled", i.e. no version.
                     if cyc.get("version_id") is None:
@@ -519,6 +691,8 @@ class Runs:
             f"[{code}][Runs] step definitions: {self._stepdef_hits[0]} reused from "
             f"the Cases phase, {self._stepdef_misses[0]} re-fetched"
         )
+        await self._append_defects_to_cases(code, cases_map, issue_defects)
+
         _cyc_with_defects = sum(1 for c in cycles.values() if c.get("defects"))
         _all_defects = {k for c in cycles.values() for k in (c.get("defects") or {})}
         self.logger.log(
@@ -552,6 +726,7 @@ class Runs:
         # Resolve who executed each test onto existing Qase users BEFORE creating
         # runs, so result authorship is retained (executions carry only an
         # Atlassian account id).
+        await self._attach_cycle_creators(code, project_id, cycles)
         await self._resolve_executors(code, cycles)
 
         # Delta mode: skip cycles whose run title already exists in the target
@@ -574,12 +749,38 @@ class Runs:
             title = cyc["name"]
             if title in existing_run_titles:
                 return
-            ts = cyc["ts"] or [0]
+            ts = [t for t in (cyc["ts"] or []) if t] or [0]
             created_on, completed_on = min(ts), max(ts)
+            # Record the REAL execution window in the description, because Qase
+            # does not keep it on the run itself.
+            #
+            # A run's end_time is overwritten with "now" the moment any result
+            # is posted to a run that has PLANNED CASES — and planned cases are
+            # exactly what makes the pass/fail verdict work. Verified on
+            # throwaways across v1 and v2, every ordering, and every field
+            # combination: create-then-results, complete-then-results, PATCH
+            # end_time, PATCH start+end, PATCH with is_completed, POST
+            # /complete with a body, include_all_cases, is_autotest. All of
+            # them end up stamped with the migration date. start_time and
+            # description both survive, so the window goes here.
+            #
+            # Not a backfill quirk: every migration creates a run and then
+            # posts historical results, so this applies to any import of past
+            # execution data. Raised with Qase; drop this once end_time is
+            # honoured.
+            description = ""
+            if completed_on:
+                description = (
+                    f"Executed in Zephyr from {self._iso(created_on)} to "
+                    f"{self._iso(completed_on)} UTC. Qase shows the migration "
+                    f"date as this run's finish time; the dates above are the "
+                    f"real ones."
+                )
             run = {
-                "name": title, "description": "",
+                "name": title, "description": description,
                 "created_on": created_on, "completed_on": completed_on,
-                "author_id": self.mappings.default_user, "is_completed": True,
+                "author_id": self.mappings.get_user_id(cyc.get("author_account")),
+                "is_completed": True,
             }
             # Jira defects for this cycle → run-level "Jira Links" custom field.
             # Same shape as the case-level field: "KEY — url" per line.

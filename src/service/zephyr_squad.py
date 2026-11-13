@@ -21,13 +21,57 @@ class ZephyrSquadService:
     """
 
     @staticmethod
+    def _blob_dir(config: ConfigManager, logger: Logger):
+        """Directory for cached attachment BYTES, or None when off.
+
+        Separate switch from the JSON cache (``cache.attachments``, default ON
+        whenever the cache is on) because blobs are large: it lives beside the
+        sqlite file under the same gitignored ``cache/`` tree and never outside it.
+        """
+        if not bool(config.get("cache.enabled")):
+            return None
+        if config.get("cache.attachments") is False:
+            logger.log("[Cache] attachment blob cache is OFF (cache.attachments=false)")
+            return None
+        from ..support.source_cache import SourceCache
+        import os
+        base = SourceCache.resolve_path(config.get("cache.dir") or "./cache", logger)
+        if not base:
+            return None
+        path = os.path.join(os.path.dirname(base), "attachments")
+        # Belt and braces: resolve_path already refuses anything outside the
+        # repo's cache/ tree, but assert it here too. These are verbatim
+        # customer files and must never land somewhere that could be committed.
+        safe_root = os.path.realpath(os.path.dirname(base))
+        if not os.path.realpath(path).startswith(safe_root + os.sep):
+            logger.log(f"[Cache] REFUSED attachment dir outside the cache tree: {path}", "error")
+            return None
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError as e:
+            logger.log(f"[Cache] cannot create attachment cache dir: {e}", "warning")
+            return None
+        n = sum(len(f) for _, _, f in os.walk(path))
+        logger.log(f"[Cache] attachment blob cache ENABLED: {path} ({n} file(s) stored). "
+                   f"Holds RAW CUSTOMER FILES; never committed.")
+        return path
+
+    @staticmethod
     def _build_cache(config: ConfigManager, logger: Logger):
         """Return a SourceCache, or None when the cache is off or unsafe.
 
-        Off by default and on purpose: a cache that defaults to on will
-        eventually serve stale source data to someone who never chose it.
+        Writing defaults ON so any failed run is resumable; READING defaults
+        OFF so a migration always reflects Zephyr as it is now. Those are
+        separate settings because conflating them costs both ways: with reads
+        on, a migration can be served stale Zephyr answers, and with the cache
+        fully off, a run that hangs loses everything it fetched because nothing
+        was persisted.
+
+        Read from the cache only to resume a run started the same day, or
+        during the freeze window when the source is known not to change.
+        ``cache.max_age_hours`` caps it regardless.
         """
-        if not bool(config.get("cache.enabled")):
+        if config.get("cache.enabled") is not None and not bool(config.get("cache.enabled")):
             logger.log("[Cache] source response cache is OFF (cache.enabled=false)")
             return None
         # Imported only on the enabled path so a disabled run pays nothing,
@@ -67,6 +111,19 @@ class ZephyrSquadService:
         # created, no file touched (src/support/source_cache.py explains why it
         # must never be committed and when to clear it).
         self.cache = self._build_cache(config, logger)
+        # Defaults encode the rule: always write, never read unless asked.
+        _cr = config.get("cache.read")
+        _cw = config.get("cache.write")
+        self.cache_read = False if _cr is None else bool(_cr)
+        self.cache_write = True if _cw is None else bool(_cw)
+        _age = config.get("cache.max_age_hours")
+        self.cache_max_age_sec = int(float(24 if _age is None else _age) * 3600)
+        if self.cache is not None:
+            logger.log(
+                f"[Cache] source cache: read={'ON' if self.cache_read else 'OFF'} "
+                f"write={'ON' if self.cache_write else 'OFF'} "
+                f"max_age={self.cache_max_age_sec // 3600}h"
+            )
 
         self.client = ZephyrSquadApiClient(
             account_id=account_id,
@@ -77,6 +134,10 @@ class ZephyrSquadService:
             page_size=page_size,
             max_requests_per_min=float(config.get("zephyr.max_requests_per_min") or 30),
             cache=self.cache,
+            blob_dir=self._blob_dir(config, logger),
+            cache_read=self.cache_read,
+            cache_write=self.cache_write,
+            cache_max_age_sec=self.cache_max_age_sec,
         )
 
         jira_base = str(config.get("jira.base_url") or "").strip()
@@ -85,7 +146,9 @@ class ZephyrSquadService:
         self.jira = None
         if jira_base and jira_email and jira_token:
             self.jira = JiraLookupClient(
-                jira_base, jira_email, jira_token, logger, cache=self.cache
+                jira_base, jira_email, jira_token, logger, cache=self.cache,
+                cache_read=self.cache_read, cache_write=self.cache_write,
+                cache_max_age_sec=self.cache_max_age_sec,
             )
             self.logger.log("[ZephyrSquad] Jira read client ENABLED")
         else:
@@ -97,6 +160,21 @@ class ZephyrSquadService:
             )
 
         self.issue_type = str(config.get("cases.jira_issue_type") or "Test").strip() or "Test"
+        # cases.jira_keys — migrate EXACTLY these Jira issue keys. Unlike
+        # cases.limit, which takes the first N by key and so skews to the oldest
+        # tests, this targets named examples. Used for demos and for reproducing
+        # a specific case a customer has raised.
+        _keys = config.get("cases.jira_keys")
+        if isinstance(_keys, str):
+            _keys = [_keys]
+        self.issue_keys = [str(k).strip() for k in (_keys or []) if str(k).strip()]
+        if self.issue_keys:
+            self.logger.log(
+                f"[ZephyrSquad] cases.jira_keys set — migrating ONLY "
+                f"{len(self.issue_keys)} named issue(s): {self.issue_keys[:8]}"
+                f"{' ...' if len(self.issue_keys) > 8 else ''}",
+                "warning",
+            )
         # Optional Jira status filter, e.g. ["Testing"] — migrate only the live
         # tests. Empty/absent = every status (previous behaviour).
         _statuses = config.get("cases.jira_statuses")
@@ -212,7 +290,8 @@ class ZephyrSquadService:
             fields = list(self.jira._TEST_ISSUE_FIELDS) + extra
         yield from self.jira.search_test_issues(
             project_key, issue_type=self.issue_type, statuses=self.issue_statuses,
-            fields=fields,
+            fields=fields, keys=self.issue_keys,
+            expand=("changelog" if self.config.get("cases.changehistory_custom_field") else None),
         )
 
     def get_issue_attachments(self, issue_id_or_key) -> list:

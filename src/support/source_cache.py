@@ -160,7 +160,8 @@ class SourceCache:
         )
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
-    def get(self, namespace: str, path: str, params=None, version=None, default=MISS):
+    def get(self, namespace: str, path: str, params=None, version=None, default=MISS,
+            max_age_sec=None):
         """Cached payload, or ``default`` on a miss. Never raises.
 
         The caller supplies the sentinel so the API clients need not import
@@ -169,10 +170,22 @@ class SourceCache:
         no-op.
         """
         try:
-            row = self._conn().execute(
-                "SELECT response_data FROM responses WHERE request_hash = ?",
-                (self.key(namespace, path, params, version),),
-            ).fetchone()
+            # max_age_sec is the safety net against the failure a read cache
+            # invites: a run served stale Zephyr answers that still reports
+            # success. Even with reads enabled, an entry older than the
+            # caller's window is treated as a miss and refetched.
+            if max_age_sec is None:
+                row = self._conn().execute(
+                    "SELECT response_data FROM responses WHERE request_hash = ?",
+                    (self.key(namespace, path, params, version),),
+                ).fetchone()
+            else:
+                row = self._conn().execute(
+                    "SELECT response_data FROM responses WHERE request_hash = ? "
+                    "AND timestamp >= datetime('now', ?)",
+                    (self.key(namespace, path, params, version),
+                     f"-{int(max_age_sec)} seconds"),
+                ).fetchone()
         except (sqlite3.Error, ValueError):
             return default
         if row is None:

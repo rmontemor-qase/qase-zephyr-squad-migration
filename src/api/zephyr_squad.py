@@ -1,3 +1,4 @@
+import os
 import hashlib
 import http.client
 import threading
@@ -17,6 +18,14 @@ _JWT_EXPIRE_SEC = 3600  # ZAPI recommends short-lived, per-request tokens
 # (and therefore never imports sqlite3) on a run with the cache disabled.
 # Identity, not truthiness: a cached [], {}, 0 or None is a real hit.
 _CACHE_MISS = object()
+
+# ZAPI answers 400 on the attachment endpoint under sustained load, not only for
+# a file that is really gone. Treating it as deterministic silently drops files
+# that a calm retry would have returned. So 400 is retried, but only a couple
+# of times: most are genuinely unavailable, and spending the full retry budget
+# on each one turns a fetch into a multi-hour crawl.
+_ATTACHMENT_400_MAX_ATTEMPTS = 3
+_ATTACHMENT_400_BACKOFF_CAP = 4.0
 
 
 class ZephyrSquadApiClient:
@@ -56,6 +65,10 @@ class ZephyrSquadApiClient:
         page_size: int = 100,
         max_requests_per_min: float = 30.0,
         cache=None,
+        blob_dir=None,
+        cache_read=False,
+        cache_write=True,
+        cache_max_age_sec=None,
     ):
         if not (account_id and access_key and secret_key):
             raise APIError(
@@ -74,6 +87,18 @@ class ZephyrSquadApiClient:
         # Opt-in read-through response cache (src/support/source_cache.py).
         # None = off, and off is the default: nothing below changes shape.
         self._cache = cache
+        # Read and write are SEPARATE on purpose. Writing always is what makes a
+        # failed run resumable; reading is what risks serving stale source data,
+        # so it is opt-in and age-capped. One combined switch gives the worst
+        # of both: stale reads when it is on, no resumability when it is off.
+        self._cache_read = bool(cache_read)
+        self._cache_write = bool(cache_write)
+        self._cache_max_age_sec = cache_max_age_sec
+        # Attachment blob cache (bytes on disk). None = off.
+        self._blob_dir = blob_dir
+        self._blob_hits = 0
+        self._blob_writes = 0
+        self._blob_misses = 0
         # Global request pacer — ZAPI Cloud enforces a strict rate limit (~1000/hr).
         # Spacing request STARTS at a steady interval avoids the 429 thundering-herd
         # (many concurrent requests all rejected + backing off) that made runs crawl.
@@ -196,8 +221,9 @@ class ZephyrSquadApiClient:
         # Keyed on path + params + version, never on `url` or the headers: the
         # JWT is re-signed per request, so either would change every call and
         # produce a silent 100% miss rate.
-        if self._cache is not None:
-            _cached = self._cache.get("zapi", path, params, version, _CACHE_MISS)
+        if self._cache is not None and self._cache_read:
+            _cached = self._cache.get("zapi", path, params, version, _CACHE_MISS,
+                                      max_age_sec=self._cache_max_age_sec)
             if _cached is not _CACHE_MISS:
                 return _cached
         for attempt in range(self.max_retries + 1):
@@ -242,7 +268,7 @@ class ZephyrSquadApiClient:
                         time.sleep(_wait)
                         continue
                     else:
-                        if self._cache is not None:
+                        if self._cache is not None and self._cache_write:
                             self._cache.set("zapi", path, params, version, _payload)
                         return _payload
                 if 400 <= response.status_code < 500 and response.status_code not in (408, 429):
@@ -542,6 +568,61 @@ class ZephyrSquadApiClient:
             out.append({"filename": name, "attachment_id": aid, "raw": a})
         return out
 
+    # ---- attachment blob cache -------------------------------------------
+    # The response cache holds JSON only; attachment BYTES were re-fetched on
+    # every run, and a re-run of a large project repeats hours of the slowest
+    # calls we make.
+    #
+    # Deliberately conservative: a blob is only served if the file exists and is
+    # non-empty, writes are atomic via a temp file + rename so a killed run can
+    # never leave a truncated file that later reads as valid, and failures are
+    # never cached so a transient error retries next time.
+
+    def _blob_path(self, attachment_id):
+        if not self._blob_dir or not attachment_id:
+            return None
+        aid = str(attachment_id)
+        safe = "".join(c for c in aid if c.isalnum() or c in "-_")
+        if not safe:
+            return None
+        return os.path.join(self._blob_dir, safe[:2], safe)
+
+    def _blob_get(self, attachment_id):
+        path = self._blob_path(attachment_id)
+        if not path:
+            return None
+        try:
+            if os.path.getsize(path) > 0:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+                if data:
+                    self._blob_hits += 1
+                    return data
+        except OSError:
+            pass
+        return None
+
+    def _blob_put(self, attachment_id, data):
+        path = self._blob_path(attachment_id)
+        if not path or not data:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, path)          # atomic; no partial file is ever visible
+            self._blob_writes += 1
+        except OSError as e:
+            if self.logger:
+                self.logger.log(f"[Cache] could not store attachment {attachment_id}: {e}", "warning")
+
+    def blob_cache_summary(self) -> str:
+        if not self._blob_dir:
+            return "[Cache] attachment blob cache OFF"
+        return (f"[Cache] attachments: {self._blob_hits} served from disk, "
+                f"{self._blob_writes} newly stored, {self._blob_misses} downloaded")
+
     def download_attachment_bytes(self, attachment_id, project_id=None, issue_id=None) -> bytes:
         """Download an attachment binary (GET /attachment/{id}, JWT-signed).
 
@@ -553,6 +634,9 @@ class ZephyrSquadApiClient:
         file and surfaced only as "empty download" — under sustained load that
         drops a large share of a project's attachments with no way to tell which.
         """
+        cached = self._blob_get(attachment_id)
+        if cached is not None:
+            return cached
         if not attachment_id:
             return None
         params = {}
@@ -562,6 +646,7 @@ class ZephyrSquadApiClient:
             params["issueId"] = issue_id
         relative_path = f"/public/rest/api/1.0/attachment/{attachment_id}"
         url = f"{self.base_url}{relative_path}"
+        _400_attempts = 0   # 400 has its own small budget, separate from max_retries
         for attempt in range(self.max_retries + 1):
             try:
                 self._throttle()
@@ -573,8 +658,35 @@ class ZephyrSquadApiClient:
                     allow_redirects=True,
                 )
                 if resp.status_code == 200 and resp.content:
+                    self._blob_misses += 1
+                    self._blob_put(attachment_id, resp.content)
                     return resp.content
-                # Deterministic 4xx (not 408/429) will never succeed — stop.
+                # 400 is NOT deterministic here — see _ATTACHMENT_400_MAX_ATTEMPTS.
+                # Give it a small, separate budget, then stop.
+                if resp.status_code == 400:
+                    _400_attempts += 1
+                    if _400_attempts >= _ATTACHMENT_400_MAX_ATTEMPTS:
+                        if self.logger:
+                            self.logger.log(
+                                f"[ZAPI] attachment {attachment_id} download failed: "
+                                f"HTTP 400 after {_400_attempts} attempt(s) — "
+                                f"treating as unavailable at source", "warning",
+                            )
+                        return None
+                    _wait = min(
+                        self.backoff_factor * (2 ** (_400_attempts - 1)),
+                        _ATTACHMENT_400_BACKOFF_CAP,
+                    )
+                    self._note_retry("http_400", _wait)
+                    if self.logger:
+                        self.logger.log(
+                            f"[ZAPI] attachment {attachment_id} download HTTP 400; "
+                            f"retrying in {_wait:.0f}s (400-attempt "
+                            f"{_400_attempts}/{_ATTACHMENT_400_MAX_ATTEMPTS})", "warning",
+                        )
+                    time.sleep(_wait)
+                    continue
+                # Other deterministic 4xx (403/404/...) will never succeed — stop.
                 if 400 <= resp.status_code < 500 and resp.status_code not in (408, 429):
                     if self.logger:
                         self.logger.log(

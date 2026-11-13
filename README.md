@@ -113,6 +113,7 @@ Logs land in `logs/`, stats in `stats/` (JSON + XLSX). Each run ends with a
 | `cases.jira_issue_type` | Jira issue type holding test cases | `Test` |
 | `cases.jira_statuses` | Only migrate tests in these Jira **statuses**, e.g. `["Testing"]`. Empty = every status. Matched on the canonical (English) status name | `[]` |
 | `cases.limit` | Cap the number of cases (validation runs). `0` = no limit | `0` |
+| `cases.step_text_limit` | Characters kept per step field (action, expected result, data). `0` = no cut. Qase stores at least 100,000 per field; the old fixed cut at 1,000 silently dropped text | `0` |
 
 ### Mapping and shaping
 

@@ -39,6 +39,9 @@ class JiraLookupClient:
         backoff_factor: float = 2.0,
         api_version: str = "2",
         cache=None,
+        cache_read=False,
+        cache_write=True,
+        cache_max_age_sec=None,
     ):
         self.base_url = (base_url or "").rstrip("/")
         self.auth = (email, api_token)
@@ -52,13 +55,17 @@ class JiraLookupClient:
         # Squad test cases ARE Jira issues, so caching only the ZAPI side would
         # leave half the read cost in place.
         self._cache = cache
+        self._cache_read = bool(cache_read)
+        self._cache_write = bool(cache_write)
+        self._cache_max_age_sec = cache_max_age_sec
 
     def _get(self, path: str, params: dict = None):
         url = f"{self.base_url}/{path.lstrip('/')}"
         # The path already carries the API version, so path + params is the
         # full request identity here.
-        if self._cache is not None:
-            _cached = self._cache.get("jira", path, params, None, _CACHE_MISS)
+        if self._cache is not None and self._cache_read:
+            _cached = self._cache.get("jira", path, params, None, _CACHE_MISS,
+                                      max_age_sec=self._cache_max_age_sec)
             if _cached is not _CACHE_MISS:
                 return _cached
         for attempt in range(self.max_retries + 1):
@@ -75,7 +82,7 @@ class JiraLookupClient:
                         _payload = response.json()
                     except (ValueError, requests.exceptions.JSONDecodeError) as e:
                         raise APIError(f"Non-JSON response from Jira {path!r}") from e
-                    if self._cache is not None:
+                    if self._cache is not None and self._cache_write:
                         self._cache.set("jira", path, params, None, _payload)
                     return _payload
                 # Fast-fail on deterministic client errors (any 4xx except 408/429)
@@ -158,6 +165,12 @@ class JiraLookupClient:
         "reporter",
         "issuelinks",  # test → story/bug/etc. traceability (excl. test-to-test)
         "fixVersions",  # -> case milestone_id + the "Fix Versions" custom field
+        "created",      # -> Qase case created_at, so a migrated case keeps the
+        "updated",      # date it was really written, not the migration date.
+                        # Both ride along on this same read: no extra API call.
+        "versions",     # Jira "Affects Version/s" -> the "Affected Versions" CF.
+                        # Distinct from fixVersions: the release a defect was
+                        # FOUND in, not the one it is fixed in.
     ]
 
     @staticmethod
@@ -186,6 +199,8 @@ class JiraLookupClient:
         fields: list = None,
         page_size: int = 100,
         statuses=None,
+        keys=None,
+        expand=None,
     ):
         """Yield pages of test issues for a project via the enhanced JQL search.
 
@@ -195,14 +210,19 @@ class JiraLookupClient:
 
         JQL: ``project = "<KEY>" AND issuetype = "<issue_type>"`` plus, when
         ``statuses`` is given, ``AND status IN (...)`` — used to migrate only the
-        live tests and skip closed/obsolete ones. NOTE: JQL matches a status by its
+        live tests and skip closed/obsolete ones — and, when ``keys`` is given,
+        ``AND key IN (...)``, which migrates exactly those issues. ``keys`` is
+        for targeted work: reproducing a specific case a customer has queried,
+        or building a small demo from real examples, without the "first N by
+        key" bias of ``cases.limit``. NOTE: JQL matches a status by its
         canonical (English) name even when the API renders localized display names.
         Each yielded item is a raw Jira issue dict (``{id, key, fields: {...}}``).
         """
         field_list = fields or self._TEST_ISSUE_FIELDS
         jql = (
             f'project = "{project_key}" AND issuetype = "{issue_type}"'
-            f"{self._jql_in_clause('status', statuses)} ORDER BY key ASC"
+            f"{self._jql_in_clause('status', statuses)}"
+            f"{self._jql_in_clause('key', keys)} ORDER BY key ASC"
         )
         self.logger.log(f"[Jira] Test-issue JQL: {jql}")
         next_token = None
@@ -212,6 +232,12 @@ class JiraLookupClient:
                 "fields": ",".join(field_list),
                 "maxResults": page_size,
             }
+            # e.g. expand="changelog" — Jira returns the full edit history on
+            # the SAME response, so the Change History field costs no extra
+            # request. Only requested when the feature is on, because it makes
+            # every page materially larger.
+            if expand:
+                params["expand"] = expand
             if next_token:
                 params["nextPageToken"] = next_token
             data = self._get(f"rest/api/{self.api_version}/search/jql", params) or {}

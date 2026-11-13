@@ -94,6 +94,7 @@ class Fields:
         await self._ensure_jira_run_field()
         # 3c — Jira issue comments mirrored onto the case (no Qase comments API)
         await self._ensure_comments_field()
+        await self._ensure_changehistory_field()
 
         # 4 — SHARED component field ("Components"), feature-flagged
         await self._ensure_component_field()
@@ -103,6 +104,7 @@ class Fields:
 
         # 4c — SHARED "Fix Versions" multiselect (milestone_id is singular)
         await self._ensure_fixversion_field()
+        await self._ensure_affectedversion_field()
 
         # 4d — arbitrary Jira custom fields, per cases.jira_custom_fields
         await self._ensure_jira_custom_fields()
@@ -314,6 +316,35 @@ class Fields:
             return
         self.mappings.fixversion_field.update(await self._ensure_option_field(title, by_project))
 
+    async def _ensure_affectedversion_field(self):
+        """SHARED multiselect CF holding a case's Jira "Affects Version/s".
+
+        Different fact from Fix Versions: the release a problem was FOUND in,
+        not the one it is fixed in. Jira draws both from the same project
+        version list, so the options come from the same lookup and cost no
+        extra call. Off unless ``features.affectedversion_custom_field`` is set,
+        since most projects do not populate the field at all.
+        """
+        if not bool(self.config.get("features.affectedversion_custom_field")):
+            return
+        title = "Affected Versions"
+        by_project = {}
+        for project in self.mappings.projects:
+            code, zephyr_key = project.get("code"), project.get("zephyr_key")
+            if not code or not zephyr_key:
+                continue
+            names = {(v.get("name") or "").strip()
+                     for v in (await self.pools.source(self.zephyr.get_versions, zephyr_key) or [])
+                     if (v.get("name") or "").strip()}
+            if names:
+                by_project[code] = names
+        if not by_project:
+            self.logger.log(f"[Fields] No Jira versions — skipping '{title}' field")
+            return
+        self.mappings.affectedversion_field.update(
+            await self._ensure_option_field(title, by_project)
+        )
+
     async def _ensure_jira_custom_fields(self):
         """Mirror arbitrary Jira custom fields onto Qase cases.
 
@@ -519,7 +550,7 @@ class Fields:
         self.mappings.component_field.update(await self._ensure_option_field(title, by_project))
 
     async def _ensure_comments_field(self):
-        """Create (or reuse) a TEXT custom field 'Comments' on CASES.
+        """TEXT custom field 'Comments' on CASES.
 
         Qase has no comments API — no such route exists (verified live: every
         candidate path 404s, and the SDK ships no comments client) — so Jira
@@ -527,7 +558,31 @@ class Fields:
         """
         if not bool(self.config.get("cases.comments_custom_field")):
             return
-        title = "Comments"
+        self.mappings.comments_field_id = await self._ensure_text_case_field("Comments")
+
+    async def _ensure_changehistory_field(self):
+        """TEXT custom field 'Change History' on CASES.
+
+        Qase builds its own Change history from edits made INSIDE Qase and
+        offers no way to write to it, so Jira's history can only ride across in
+        a custom field, exactly as Comments does.
+
+        Useful for audit: it is the only place recording what was edited on a
+        test script and, through its status transitions, who reviewed and
+        approved it. Where the dedicated Jira approver fields are left empty,
+        the changelog is the ONLY source for that.
+
+        Costs no extra request — the changelog rides along on the issue search
+        via ``expand=changelog``.
+        """
+        if not bool(self.config.get("cases.changehistory_custom_field")):
+            return
+        self.mappings.changehistory_field_id = await self._ensure_text_case_field(
+            "Change History"
+        )
+
+    async def _ensure_text_case_field(self, title: str):
+        """Create or reuse a TEXT custom field on CASES; returns its id or None."""
         codes = sorted({p["code"] for p in self.mappings.projects if p.get("code")})
         try:
             existing = await self.pools.qs(self.qase.get_case_custom_fields) or []
@@ -537,7 +592,6 @@ class Fields:
         for cf in existing:
             if (getattr(cf, "title", "") or "").strip().lower() == title.lower():
                 cf_id = int(getattr(cf, "id"))
-                self.mappings.comments_field_id = cf_id
                 if not bool(getattr(cf, "is_enabled_for_all_projects", False)):
                     have = [str(c) for c in (getattr(cf, "projects_codes", None) or [])]
                     missing = [c for c in codes if c not in have]
@@ -551,17 +605,17 @@ class Fields:
                             f"(id={cf_id}) to {missing}", "info" if ok else "warning",
                         )
                 self.logger.log(f"[Fields] Reusing '{title}' CF (id={cf_id})")
-                return
+                return cf_id
         cf_id = await self.pools.qs(self.qase.create_custom_field, {
             "title": title, "entity": 0, "type": 2,  # 0=case, 2=text
             "is_required": False, "is_visible": True, "is_filterable": True,
             "is_enabled_for_all_projects": False, "projects_codes": codes,
         })
         if cf_id:
-            self.mappings.comments_field_id = cf_id
             self.logger.log(f"[Fields] Created '{title}' CF (id={cf_id})")
         else:
             self.logger.log(f"[Fields] Could not create '{title}' CF", "error")
+        return cf_id
 
     async def _ensure_jira_run_field(self):
         """Create (or reuse) a TEXT custom field 'Jira Links' scoped to RUNS.
